@@ -1,4 +1,4 @@
-# Ultralytics YOLOv5 🚀, AGPL-3.0 license
+# Ultralytics 🚀 AGPL-3.0 License - https://ultralytics.com/license
 """Dataloaders and dataset utils."""
 
 import contextlib
@@ -359,8 +359,7 @@ class LoadImages:
         else:
             self.cap = None
         assert self.nf > 0, (
-            f"No images or videos found in {p}. "
-            f"Supported formats are:\nimages: {IMG_FORMATS}\nvideos: {VID_FORMATS}"
+            f"No images or videos found in {p}. Supported formats are:\nimages: {IMG_FORMATS}\nvideos: {VID_FORMATS}"
         )
 
     def __iter__(self):
@@ -694,16 +693,17 @@ class LoadImagesAndLabels(Dataset):
             b, gb = 0, 1 << 30  # bytes of cached images, bytes per gigabytes
             self.im_hw0, self.im_hw = [None] * n, [None] * n
             fcn = self.cache_images_to_disk if cache_images == "disk" else self.load_image
-            results = ThreadPool(NUM_THREADS).imap(lambda i: (i, fcn(i)), self.indices)
-            pbar = tqdm(results, total=len(self.indices), bar_format=TQDM_BAR_FORMAT, disable=LOCAL_RANK > 0)
-            for i, x in pbar:
-                if cache_images == "disk":
-                    b += self.npy_files[i].stat().st_size
-                else:  # 'ram'
-                    self.ims[i], self.im_hw0[i], self.im_hw[i] = x  # im, hw_orig, hw_resized = load_image(self, i)
-                    b += self.ims[i].nbytes * WORLD_SIZE
-                pbar.desc = f"{prefix}Caching images ({b / gb:.1f}GB {cache_images})"
-            pbar.close()
+            with ThreadPool(NUM_THREADS) as pool:
+                results = pool.imap(lambda i: (i, fcn(i)), self.indices)
+                pbar = tqdm(results, total=len(self.indices), bar_format=TQDM_BAR_FORMAT, disable=LOCAL_RANK > 0)
+                for i, x in pbar:
+                    if cache_images == "disk":
+                        b += self.npy_files[i].stat().st_size
+                    else:  # 'ram'
+                        self.ims[i], self.im_hw0[i], self.im_hw[i] = x  # im, hw_orig, hw_resized = load_image(self, i)
+                        b += self.ims[i].nbytes * WORLD_SIZE
+                    pbar.desc = f"{prefix}Caching images ({b / gb:.1f}GB {cache_images})"
+                pbar.close()
 
     def check_cache_ram(self, safety_margin=0.1, prefix=""):
         """Checks if available RAM is sufficient for caching images, adjusting for a safety margin."""
@@ -718,8 +718,8 @@ class LoadImagesAndLabels(Dataset):
         cache = mem_required * (1 + safety_margin) < mem.available  # to cache or not to cache, that is the question
         if not cache:
             LOGGER.info(
-                f'{prefix}{mem_required / gb:.1f}GB RAM required, '
-                f'{mem.available / gb:.1f}/{mem.total / gb:.1f}GB available, '
+                f"{prefix}{mem_required / gb:.1f}GB RAM required, "
+                f"{mem.available / gb:.1f}/{mem.total / gb:.1f}GB available, "
                 f"{'caching images ✅' if cache else 'not caching images ⚠️'}"
             )
         return cache
@@ -779,8 +779,7 @@ class LoadImagesAndLabels(Dataset):
         index = self.indices[index]  # linear, shuffled, or image_weights
 
         hyp = self.hyp
-        mosaic = self.mosaic and random.random() < hyp["mosaic"]
-        if mosaic:
+        if mosaic := self.mosaic and random.random() < hyp["mosaic"]:
             # Load mosaic
             img, labels = self.load_mosaic(index)
             shapes = None
@@ -1171,8 +1170,7 @@ def verify_image_label(args):
                     segments = [np.array(x[1:], dtype=np.float32).reshape(-1, 2) for x in lb]  # (cls, xy1...)
                     lb = np.concatenate((classes.reshape(-1, 1), segments2boxes(segments)), 1)  # (cls, xywh)
                 lb = np.array(lb, dtype=np.float32)
-            nl = len(lb)
-            if nl:
+            if nl := len(lb):
                 assert lb.shape[1] == 5, f"labels require 5 columns, {lb.shape[1]} columns detected"
                 assert (lb >= 0).all(), f"negative label values {lb[lb < 0]}"
                 assert (lb[:, 1:] <= 1).all(), f"non-normalized or out of bounds coordinates {lb[:, 1:][lb[:, 1:] > 1]}"
