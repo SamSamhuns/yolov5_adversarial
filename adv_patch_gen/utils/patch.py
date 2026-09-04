@@ -15,8 +15,11 @@ class PatchTransformer(nn.Module):
     """PatchTransformer: transforms batch of patches
 
     Module providing the functionality necessary to transform a batch of patches, randomly adjusting brightness and
-    contrast, adding random amount of noise, and rotating randomly. Resizes patches according to as size based on the
-    batch of labels, and pads them to the dimension of an image.
+    contrast, adding random amount of noise, and rotating randomly. Scales and places one patch per label box and
+    returns them on image sized canvases, zero everywhere a patch does not cover.
+
+    grid_sample samples the patch itself rather than a copy padded out to the model input size, which keeps the
+    intermediates at patch resolution instead of allocating two [bsize * max_labels, c, H, W] tensors.
     """
 
     def __init__(
@@ -66,9 +69,6 @@ class PatchTransformer(nn.Module):
             adv_patch = adv_patch * mul_gau + add_gau
         adv_patch = self.medianpooler(adv_patch.unsqueeze(0))
         m_h, m_w = model_in_sz
-        # Determine size of padding, per axis so non-square patches/inputs stay centered
-        pad_w = (m_w - adv_patch.size(-1)) / 2
-        pad_h = (m_h - adv_patch.size(-2)) / 2
         # Make a batch of patches
         adv_patch = adv_patch.unsqueeze(0)
         adv_batch = adv_patch.expand(
@@ -96,15 +96,13 @@ class PatchTransformer(nn.Module):
 
             adv_batch = torch.clamp(adv_batch, 0.000001, 0.99999)
 
-        # lab_batch is zero-padded up to max_labels, so drop patches for the zero area filler rows
+        # lab_batch is zero-padded up to max_labels, so drop patches for the zero area filler rows.
+        # The mask also marks where a patch landed, which PatchApplier needs since the clamp below
+        # lifts every pixel off exact zero.
         valid_box = (lab_batch[..., 3] * lab_batch[..., 4]) > 0  # [bsize, max_bbox_labels]
-        # [bsize, max_bbox_labels, pchannel, pheight, pwidth]
-        msk_batch = valid_box[:, :, None, None, None].to(adv_batch.dtype).expand_as(adv_batch)
-
-        # Pad patch and mask to image dimensions
-        patch_pad = nn.ConstantPad2d((int(pad_w + 0.5), int(pad_w), int(pad_h + 0.5), int(pad_h)), 0)
-        adv_batch = patch_pad(adv_batch)
-        msk_batch = patch_pad(msk_batch)
+        # one channel is enough, the mask is identical across channels and broadcasts on the multiply
+        msk_batch = valid_box[:, :, None, None, None].to(adv_batch.dtype)
+        msk_batch = msk_batch.expand(-1, -1, 1, adv_batch.size(-2), adv_batch.size(-1))
 
         # Rotation and rescaling transforms
         anglesize = lab_batch.size(0) * lab_batch.size(1)
@@ -114,13 +112,13 @@ class PatchTransformer(nn.Module):
             angle = self.tensor(anglesize).fill_(0)
 
         # Resizes and rotates
-        current_patch_size = adv_patch.size(-1)
+        p_h_pooled, p_w_pooled = adv_batch.size(-2), adv_batch.size(-1)
         tsize = np.random.uniform(*self.t_size_frac)
         # patch is sized off the bbox diagonal in model input pixels
         target_size = tsize * torch.sqrt(((lab_batch[:, :, 3] * m_w) ** 2) + ((lab_batch[:, :, 4] * m_h) ** 2))
         # zero area filler rows would give scale 0 and hence inf in theta below, so give them a
-        # unit scale instead. Their patches are zeroed out by msk_batch after grid_sample.
-        target_size = torch.where(valid_box, target_size, torch.full_like(target_size, current_patch_size))
+        # full canvas scale instead. Their patches are zeroed out by msk_batch after grid_sample.
+        target_size = torch.where(valid_box, target_size, torch.full_like(target_size, float(m_w)))
 
         target_x = lab_batch[:, :, 1].view(np.prod(batch_size))
         target_y = lab_batch[:, :, 2].view(np.prod(batch_size))
@@ -131,13 +129,16 @@ class PatchTransformer(nn.Module):
             target_x = target_x + off_x
             off_y = targetoff_y * (self.tensor(targetoff_y.size()).uniform_(*self.y_off_loc))
             target_y = target_y + off_y
-        scale = target_size / current_patch_size
-        scale = scale.view(anglesize)
+        # grid_sample reads the patch directly rather than a canvas sized copy of it, so the scale
+        # is the rendered fraction of each image axis. Normalizing x and y separately also keeps
+        # the patch square for a non-square model_in_sz, and keeps its aspect for a non-square patch.
+        scale_x = (target_size / m_w).view(anglesize)
+        scale_y = (target_size * (p_h_pooled / p_w_pooled) / m_h).view(anglesize)
 
+        # reshape not view: both are expanded views when no transforms materialized them
         s = adv_batch.size()
-        adv_batch = adv_batch.view(s[0] * s[1], s[2], s[3], s[4])
-        # reshape not view: msk_batch is an expanded view when padding is a no-op
-        msk_batch = msk_batch.reshape(s[0] * s[1], s[2], s[3], s[4])
+        adv_batch = adv_batch.reshape(s[0] * s[1], s[2], s[3], s[4])
+        msk_batch = msk_batch.reshape(s[0] * s[1], 1, s[3], s[4])
 
         tx = (-target_x + 0.5) * 2
         ty = (-target_y + 0.5) * 2
@@ -147,19 +148,20 @@ class PatchTransformer(nn.Module):
         # Theta = rotation/rescale matrix
         # Theta = input batch of affine matrices with shape (N×2×3) for 2D or (N×3×4) for 3D
         theta = self.tensor(anglesize, 2, 3).fill_(0)
-        theta[:, 0, 0] = cos / scale
-        theta[:, 0, 1] = sin / scale
-        theta[:, 0, 2] = tx * cos / scale + ty * sin / scale
-        theta[:, 1, 0] = -sin / scale
-        theta[:, 1, 1] = cos / scale
-        theta[:, 1, 2] = -tx * sin / scale + ty * cos / scale
+        theta[:, 0, 0] = cos / scale_x
+        theta[:, 0, 1] = sin / scale_x
+        theta[:, 0, 2] = (tx * cos + ty * sin) / scale_x
+        theta[:, 1, 0] = -sin / scale_y
+        theta[:, 1, 1] = cos / scale_y
+        theta[:, 1, 2] = (-tx * sin + ty * cos) / scale_y
 
-        grid = F.affine_grid(theta, adv_batch.shape, align_corners=False)
+        out_shape = (s[0] * s[1], s[2], m_h, m_w)
+        grid = F.affine_grid(theta, out_shape, align_corners=False)
         adv_batch_t = F.grid_sample(adv_batch, grid, align_corners=False)
         msk_batch_t = F.grid_sample(msk_batch, grid, align_corners=False)
 
-        adv_batch_t = adv_batch_t.view(s[0], s[1], s[2], s[3], s[4])
-        msk_batch_t = msk_batch_t.view(s[0], s[1], s[2], s[3], s[4])
+        adv_batch_t = adv_batch_t.view(s[0], s[1], s[2], m_h, m_w)
+        msk_batch_t = msk_batch_t.view(s[0], s[1], 1, m_h, m_w)
 
         adv_batch_t = torch.clamp(adv_batch_t, 0.000001, 0.999999)
 

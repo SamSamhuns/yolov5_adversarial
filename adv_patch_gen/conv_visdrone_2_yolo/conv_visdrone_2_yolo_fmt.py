@@ -9,6 +9,7 @@ import argparse
 import glob
 import os
 import os.path as osp
+from pathlib import Path
 from typing import Optional
 
 import imagesize
@@ -109,14 +110,15 @@ def conv_visdrone_2_yolo(
     os.makedirs(target_annot_dir, exist_ok=True)
     low_dim_cutoff = float("-inf") if not low_dim_cutoff else low_dim_cutoff
     low_area_cutoff = float("-inf") if not low_area_cutoff else low_area_cutoff
-    target_img_list_fpath = osp.join(osp.dirname(target_annot_dir), source_annot_dir.split("/")[-2].lower() + ".txt")
+    split_name = Path(source_annot_dir).resolve().parent.name.lower()
+    target_img_list_fpath = osp.join(osp.dirname(target_annot_dir), split_name + ".txt")
 
-    with tqdm.tqdm(total=len(src_image_paths)) as pbar, open(target_img_list_fpath, "w") as imgw:
-        orig_box_count = new_box_count = 0
+    with tqdm.tqdm(total=len(src_image_paths)) as pbar, open(target_img_list_fpath, "w", encoding="utf-8") as imgw:
+        orig_box_count = new_box_count = skipped = 0
         for src_annot_file, src_image_file in zip(src_annot_paths, src_image_paths):
             try:
                 iw, ih = imagesize.get(src_image_file)
-                target_annot_file = osp.join(target_annot_dir, src_annot_file.split("/")[-1])
+                target_annot_file = osp.join(target_annot_dir, osp.basename(src_annot_file))
                 with open(src_annot_file, "r", encoding="utf-8") as fr, open(
                     target_annot_file, "w", encoding="utf-8"
                 ) as fw:
@@ -146,11 +148,18 @@ def conv_visdrone_2_yolo(
                     osp.basename(target_annot_file).split(".")[0] + osp.splitext(src_image_file)[1],
                 )
                 imgw.write(f"{osp.abspath(target_image_path)}\n")
-            except Exception as excep:
-                print(f"{excep}: Error reading img {src_image_file}")
+            except (OSError, ValueError, IndexError, KeyError) as excep:
+                # a malformed annot line or unreadable image, keep going but do not hide it
+                skipped += 1
+                print(f"{type(excep).__name__}: {excep}. Skipping {src_image_file}")
             pbar.update(1)
+        if skipped:
+            print(f"Skipped {skipped} of {len(src_image_paths)} images, see the errors above")
         print(f"Original Box Count: {orig_box_count}. Converted Box Count {new_box_count}")
-        print(f"{100 * (new_box_count) / orig_box_count:.2f}% of total boxes kept")
+        if orig_box_count:
+            print(f"{100 * new_box_count / orig_box_count:.2f}% of total boxes kept")
+        else:
+            print(f"No boxes of classes {sorted(CLASS_2_CONSIDER)} found in {source_annot_dir}")
 
 
 def main():

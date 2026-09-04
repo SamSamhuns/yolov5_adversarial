@@ -6,6 +6,7 @@
     "val_image_dir": "data/val/images",     # epoch freq for running validation run. 1 means validate after every epoch. 0 or null means no val
     "use_even_odd_images": "all",           # (str), ('all', 'even', 'odd'): use images with even/odd numbers in the last char of their filenames
     "log_dir": "runs/train_adversarial",
+    "run_tensorboard": true,                # bool: also serve tensorboard on tensorboard_port. Set false for headless/docker runs. Defaults to true when omitted
     "tensorboard_port": 8994,
     "tensorboard_batch_log_interval": 15,
     "weights_file": "runs/weights/best.pt",

@@ -9,13 +9,13 @@ import json
 import os
 import os.path as osp
 import time
+from pathlib import Path
 
 import numpy as np
 import torch
 import torch.nn.functional as F
 from easydict import EasyDict as edict
 from PIL import Image
-from tensorboard import program
 from torch import autograd, optim
 from torch.utils.tensorboard import SummaryWriter
 from torchvision import transforms as T
@@ -51,7 +51,7 @@ class PatchTrainer:
         self.patch_applier = PatchApplier(cfg.patch_alpha).to(self.dev)
         self.prob_extractor = MaxProbExtractor(cfg).to(self.dev)
         self.sal_loss = SaliencyLoss().to(self.dev)
-        self.nps_loss = NPSLoss(cfg.triplet_printfile, cfg.patch_size).to(self.dev)
+        self.nps_loss = NPSLoss(cfg.triplet_printfile).to(self.dev)
         self.tv_loss = TotalVariationLoss().to(self.dev)
 
         # freeze entire detection model
@@ -60,7 +60,7 @@ class PatchTrainer:
 
         # set log dir
         cfg.log_dir = osp.join(cfg.log_dir, f'{time.strftime("%Y%m%d-%H%M%S")}_{cfg.patch_name}')
-        self.writer = self.init_tensorboard(cfg.log_dir, cfg.tensorboard_port)
+        self.writer = self.init_tensorboard(cfg.log_dir, cfg.tensorboard_port, cfg.get("run_tensorboard", True))
         # save config parameters to tensorboard logs
         for cfg_key, cfg_val in cfg.items():
             self.writer.add_text(cfg_key, str(cfg_val))
@@ -87,7 +87,6 @@ class PatchTrainer:
                 transform=transforms,
                 filter_class_ids=cfg.objective_class_id,
                 min_pixel_area=cfg.min_pixel_area,
-                shuffle=True,
             ),
             batch_size=cfg.batch_size,
             shuffle=True,
@@ -96,12 +95,15 @@ class PatchTrainer:
         )
         self.epoch_length = len(self.train_loader)
 
-    def init_tensorboard(self, log_dir: str = None, port: int = 6006, run_tb=True):
-        """Initialize tensorboard with optional name."""
+    @staticmethod
+    def init_tensorboard(log_dir: str = None, port: int = 6006, run_tb: bool = True):
+        """Create the SummaryWriter, optionally also serving tensorboard on port."""
         if run_tb:
+            from tensorboard import program  # noqa: PLC0415  heavy import, only needed when serving
+
             while is_port_in_use(port) and port < 65535:
+                print(f"Port {port} is currently in use. Switching to {port + 1} for tensorboard logging")
                 port += 1
-                print(f"Port {port - 1} is currently in use. Switching to {port} for tensorboard logging")
 
             tboard = program.TensorBoard()
             tboard.configure(argv=[None, "--logdir", log_dir, "--port", str(port)])
@@ -153,25 +155,17 @@ class PatchTrainer:
         with open(osp.join(self.cfg.log_dir, "cfg.json"), "w", encoding="utf-8") as json_f:
             json.dump(self.cfg, json_f, ensure_ascii=False, indent=4)
 
-        # fix loss targets
-        loss_target = self.cfg.loss_target
-        if loss_target == "obj":
-            self.cfg.loss_target = lambda obj, cls: obj
-        elif loss_target == "cls":
-            self.cfg.loss_target = lambda obj, cls: cls
-        elif loss_target in {"obj * cls", "obj*cls"}:
-            self.cfg.loss_target = lambda obj, cls: obj * cls
-        else:
-            raise NotImplementedError(f"Loss target {loss_target} not been implemented")
+        # swap the loss target name for the function MaxProbExtractor calls
+        self.cfg.loss_target = {
+            "obj": lambda obj, cls: obj,
+            "cls": lambda obj, cls: cls,
+            "obj * cls": lambda obj, cls: obj * cls,
+            "obj*cls": lambda obj, cls: obj * cls,
+        }[self.cfg.loss_target]
 
         # Generate init patch
-        supported_modes = {"L", "RGB"}
-        if self.cfg.patch_img_mode not in supported_modes:
-            raise NotImplementedError(f"Currently only {supported_modes} channels supported")
-        if self.cfg.patch_src == "gray":
-            adv_patch_cpu = self.generate_patch("gray", self.cfg.patch_img_mode)
-        elif self.cfg.patch_src == "random":
-            adv_patch_cpu = self.generate_patch("random", self.cfg.patch_img_mode)
+        if self.cfg.patch_src in {"gray", "random"}:
+            adv_patch_cpu = self.generate_patch(self.cfg.patch_src, self.cfg.patch_img_mode)
         else:
             adv_patch_cpu = self.read_image(self.cfg.patch_src, self.cfg.patch_img_mode)
         adv_patch = adv_patch_cpu.to(self.dev).requires_grad_(True)
@@ -184,6 +178,8 @@ class PatchTrainer:
             print(f"WARNING: use_amp is set but device is {self.dev.type}, running without AMP")
         scaler = GradScaler(enabled=use_amp)
 
+        best_asr = -1.0
+        best_patch_path = osp.join(patch_dir, "best.png")
         start_time = time.time()
         for epoch in range(1, self.cfg.n_epochs + 1):
             out_patch_path = osp.join(patch_dir, f"e_{epoch}.png")
@@ -231,7 +227,7 @@ class PatchTrainer:
                     tv_loss = torch.max(tv * self.cfg.tv_mult, min_tv_loss)
 
                     loss = det_loss + sal_loss + nps_loss + tv_loss
-                    ep_loss += loss
+                    ep_loss += loss.detach()
 
                     scaler.scale(loss).backward()
                     scaler.step(optimizer)
@@ -266,12 +262,20 @@ class PatchTrainer:
 
             # run validation to calc asr on val set if self.val_dir is not None
             if all([self.cfg.val_image_dir, self.cfg.val_epoch_freq]) and epoch % self.cfg.val_epoch_freq == 0:
+                if not osp.isfile(out_patch_path):  # val reads the patch back from disk
+                    T.ToPILImage(self.cfg.patch_img_mode)(adv_patch.detach().cpu()).save(out_patch_path)
                 with torch.no_grad():
-                    self.val(epoch, out_patch_path)
+                    asr_a = self.val(epoch, out_patch_path)
+                if asr_a > best_asr:
+                    best_asr = asr_a
+                    T.ToPILImage(self.cfg.patch_img_mode)(adv_patch.detach().cpu()).save(best_patch_path)
+                    print(f"New best patch at epoch {epoch}, asr_a={asr_a:.3f}, saved to {best_patch_path}")
+        if best_asr >= 0:
+            print(f"Best val asr_a={best_asr:.3f}, best patch at {best_patch_path}")
         print(f"Total training time {time.time() - start_time:.2f}s")
 
-    def val(self, epoch: int, patchfile: str, conf_thresh: float = 0.4, nms_thresh: float = 0.4) -> None:
-        """Calculates the attack success rate according for the patch with respect to different bounding box areas."""
+    def val(self, epoch: int, patchfile: str, conf_thresh: float = 0.4, nms_thresh: float = 0.4) -> float:
+        """Calculates the attack success rate for the patch per bbox area, returning the aggregate ASR."""
         # load patch from file
         patch_img = Image.open(patchfile).convert(self.cfg.patch_img_mode)
         patch_img = T.Resize(self.cfg.patch_size)(patch_img)
@@ -291,7 +295,7 @@ class PatchTrainer:
         zeros_tensor = torch.zeros([1, 5]).to(self.dev)
         #### iterate through all images ####
         for imgfile in tqdm(img_paths, desc=f"Running val epoch {epoch}"):
-            img_name = osp.splitext(imgfile)[0].split("/")[-1]
+            img_name = Path(imgfile).stem
             img = Image.open(imgfile).convert("RGB")
             padded_img = pad_to_square(img)
             padded_img = T.Resize(self.cfg.model_in_sz)(padded_img)
@@ -380,6 +384,7 @@ class PatchTrainer:
         self.writer.add_scalar("val_asr_per_epoch/area_all", asr_a, epoch)
         torch.cuda.empty_cache()
         self.patch_transformer.t_size_frac = train_t_size_frac
+        return float(asr_a)
 
 
 def main():

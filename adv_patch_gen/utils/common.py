@@ -2,7 +2,7 @@
 
 import random
 import socket
-from typing import Optional, Tuple, Union
+from typing import Optional, Tuple
 
 import numpy as np
 import torch
@@ -61,9 +61,3 @@ def pad_to_square(img: Image, pad_rgb: Tuple[int, int, int] = (127, 127, 127)) -
             padded_img.paste(img, (0, int(padding)))
     return padded_img
 
-
-def calc_mean_and_std_err(arr: Union[list, np.ndarray]) -> Tuple[float, float]:
-    """" Calculate mean and standard error."""
-    mean = np.mean(arr)
-    std_err = np.std(arr, ddof=1) / np.sqrt(len(arr))
-    return mean, std_err

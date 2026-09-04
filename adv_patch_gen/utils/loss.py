@@ -1,7 +1,5 @@
 """Loss functions used in patch generation."""
 
-from typing import Tuple
-
 import torch
 import torch.nn as nn
 
@@ -96,13 +94,12 @@ class NPSLoss(nn.Module):
     Reference: https://users.ece.cmu.edu/~lbauer/papers/2016/ccs2016-face-recognition.pdf
         Args:
             triplet_scores_fpath: str, path to csv file with RGB triplets sep by commas in newlines
-            size: Tuple[int, int], Tuple with height, width of the patch
     """
 
-    def __init__(self, triplet_scores_fpath: str, size: Tuple[int, int]):
+    def __init__(self, triplet_scores_fpath: str):
         super(NPSLoss, self).__init__()
         self.printability_array = nn.Parameter(
-            self.get_printability_array(triplet_scores_fpath, size), requires_grad=False
+            self.get_printability_array(triplet_scores_fpath), requires_grad=False
         )
 
     def forward(self, adv_patch):
@@ -119,25 +116,19 @@ class NPSLoss(nn.Module):
         nps_score = torch.sum(nps_score, 0)
         return nps_score / torch.numel(adv_patch)
 
-    def get_printability_array(self, triplet_scores_fpath: str, size: Tuple[int, int]) -> torch.Tensor:
+    @staticmethod
+    def get_printability_array(triplet_scores_fpath: str) -> torch.Tensor:
         """
-        Get printability tensor array holding the rgb triplets (range [0,1]) loaded from triplet_scores_fpath
+        Get printability tensor of shape [n_triplets, 3, 1, 1] holding the rgb triplets (range [0,1])
+        loaded from triplet_scores_fpath. It broadcasts against a [3, H, W] patch of any size.
         Args:
             triplet_scores_fpath: str, path to csv file with RGB triplets sep by commas in newlines
-            size: Tuple[int, int], Tuple with height, width of the patch
         """
         ref_triplet_list = []
-        # read in reference printability triplets into a list
         with open(triplet_scores_fpath, "r", encoding="utf-8") as f:
             for line in f:
-                ref_triplet_list.append(line.strip().split(","))
-
-        p_h, p_w = size
-        printability_array = []
-        for ref_triplet in ref_triplet_list:
-            r, g, b = map(float, ref_triplet)
-            ref_tensor_img = torch.stack(
-                [torch.full((p_h, p_w), r), torch.full((p_h, p_w), g), torch.full((p_h, p_w), b)]
-            )
-            printability_array.append(ref_tensor_img.float())
-        return torch.stack(printability_array)
+                if line.strip():
+                    ref_triplet_list.append([float(v) for v in line.strip().split(",")])
+        if not ref_triplet_list:
+            raise ValueError(f"No rgb triplets found in {triplet_scores_fpath}")
+        return torch.tensor(ref_triplet_list, dtype=torch.float32).view(len(ref_triplet_list), 3, 1, 1)
