@@ -4,7 +4,6 @@
 import contextlib
 import math
 import os
-from copy import copy
 from pathlib import Path
 
 import cv2
@@ -15,125 +14,29 @@ import pandas as pd
 import seaborn as sn
 import torch
 from PIL import Image, ImageDraw
-from scipy.ndimage.filters import gaussian_filter1d
-from ultralytics.utils.plotting import Annotator
+from scipy.ndimage import gaussian_filter1d
+from ultralytics.utils.plotting import Annotator, colors
 
 from utils import TryExcept, threaded
-from utils.general import LOGGER, clip_boxes, increment_path, xywh2xyxy, xyxy2xywh
+from utils.general import LOGGER, xywh2xyxy, xyxy2xywh
 from utils.metrics import fitness
 
 # Settings
-RANK = int(os.getenv("RANK", -1))
-matplotlib.rc("font", **{"size": 11})
+RANK = int(os.getenv("RANK", "-1"))
+matplotlib.rc("font", size=11)
 matplotlib.use("Agg")  # for writing to files only
 
 
-class Colors:
-    """Provides an RGB color palette derived from Ultralytics color scheme for visualization tasks."""
-
-    def __init__(self):
-        """
-        Initializes the Colors class with a palette derived from Ultralytics color scheme, converting hex codes to RGB.
-
-        Colors derived from `hex = matplotlib.colors.TABLEAU_COLORS.values()`.
-        """
-        hexs = (
-            "FF3838",
-            "FF9D97",
-            "FF701F",
-            "FFB21D",
-            "CFD231",
-            "48F90A",
-            "92CC17",
-            "3DDB86",
-            "1A9334",
-            "00D4BB",
-            "2C99A8",
-            "00C2FF",
-            "344593",
-            "6473FF",
-            "0018EC",
-            "8438FF",
-            "520085",
-            "CB38FF",
-            "FF95C8",
-            "FF37C7",
-        )
-        self.palette = [self.hex2rgb(f"#{c}") for c in hexs]
-        self.n = len(self.palette)
-
-    def __call__(self, i, bgr=False):
-        """Returns color from palette by index `i`, in BGR format if `bgr=True`, else RGB; `i` is an integer index."""
-        c = self.palette[int(i) % self.n]
-        return (c[2], c[1], c[0]) if bgr else c
-
-    @staticmethod
-    def hex2rgb(h):
-        """Converts hexadecimal color `h` to an RGB tuple (PIL-compatible) with order (R, G, B)."""
-        return tuple(int(h[1 + i : 1 + i + 2], 16) for i in (0, 2, 4))
-
-
-colors = Colors()  # create instance for 'from utils.plots import colors'
-
-
-def feature_visualization(x, module_type, stage, n=32, save_dir=Path("runs/detect/exp")):
-    """
-    x:              Features to be visualized
-    module_type:    Module type
-    stage:          Module stage within model
-    n:              Maximum number of feature maps to plot
-    save_dir:       Directory to save results.
-    """
-    if ("Detect" not in module_type) and (
-        "Segment" not in module_type
-    ):  # 'Detect' for Object Detect task,'Segment' for Segment task
-        _batch, channels, height, width = x.shape  # batch, channels, height, width
-        if height > 1 and width > 1:
-            f = save_dir / f"stage{stage}_{module_type.split('.')[-1]}_features.png"  # filename
-
-            blocks = torch.chunk(x[0].cpu(), channels, dim=0)  # select batch index 0, block by channels
-            n = min(n, channels)  # number of plots
-            _fig, ax = plt.subplots(math.ceil(n / 8), 8, tight_layout=True)
-            ax = ax.ravel()
-            plt.subplots_adjust(wspace=0.05, hspace=0.05)
-            for i in range(n):
-                ax[i].imshow(blocks[i].squeeze())  # cmap='gray'
-                ax[i].axis("off")
-
-            LOGGER.info(f"Saving {f}... ({n}/{channels})")
-            plt.savefig(f, dpi=300, bbox_inches="tight")
-            plt.close()
-            np.save(str(f.with_suffix(".npy")), x[0].cpu().numpy())  # npy save
-
-
 def hist2d(x, y, n=100):
-    """
-    Generates a logarithmic 2D histogram, useful for visualizing label or evolution distributions.
+    """Generates a logarithmic 2D histogram, useful for visualizing label or evolution distributions.
 
-    Used in used in labels.png and evolve.png.
+    Used in labels.png and evolve.png.
     """
     xedges, yedges = np.linspace(x.min(), x.max(), n), np.linspace(y.min(), y.max(), n)
     hist, xedges, yedges = np.histogram2d(x, y, (xedges, yedges))
     xidx = np.clip(np.digitize(x, xedges) - 1, 0, hist.shape[0] - 1)
     yidx = np.clip(np.digitize(y, yedges) - 1, 0, hist.shape[1] - 1)
     return np.log(hist[xidx, yidx])
-
-
-def butter_lowpass_filtfilt(data, cutoff=1500, fs=50000, order=5):
-    """Applies a low-pass Butterworth filter to `data` with specified `cutoff`, `fs`, and `order`."""
-    from scipy.signal import butter, filtfilt
-
-    # https://stackoverflow.com/questions/28536191/how-to-filter-smooth-with-scipy-numpy
-    def butter_lowpass(cutoff, fs, order):
-        """Applies a low-pass Butterworth filter to a signal with specified cutoff frequency, sample rate, and filter
-        order.
-        """
-        nyq = 0.5 * fs
-        normal_cutoff = cutoff / nyq
-        return butter(order, normal_cutoff, btype="low", analog=False)
-
-    b, a = butter_lowpass(cutoff, fs, order=order)
-    return filtfilt(b, a, data)  # forward-backward filter
 
 
 def output_to_target(output, max_det=300):
@@ -213,65 +116,8 @@ def plot_images(images, targets, paths=None, fname="images.jpg", names=None):
     annotator.im.save(fname)  # save
 
 
-def plot_lr_scheduler(optimizer, scheduler, epochs=300, save_dir=""):
-    """Plots learning rate schedule for given optimizer and scheduler, saving plot to `save_dir`."""
-    optimizer, scheduler = copy(optimizer), copy(scheduler)  # do not modify originals
-    y = []
-    for _ in range(epochs):
-        scheduler.step()
-        y.append(optimizer.param_groups[0]["lr"])
-    plt.plot(y, ".-", label="LR")
-    plt.xlabel("epoch")
-    plt.ylabel("LR")
-    plt.grid()
-    plt.xlim(0, epochs)
-    plt.ylim(0)
-    plt.savefig(Path(save_dir) / "LR.png", dpi=200)
-    plt.close()
-
-
-def plot_val_txt():
-    """
-    Plots 2D and 1D histograms of bounding box centers from 'val.txt' using matplotlib, saving as 'hist2d.png' and
-    'hist1d.png'.
-
-    Example: from utils.plots import *; plot_val()
-    """
-    x = np.loadtxt("val.txt", dtype=np.float32)
-    box = xyxy2xywh(x[:, :4])
-    cx, cy = box[:, 0], box[:, 1]
-
-    fig, ax = plt.subplots(1, 1, figsize=(6, 6), tight_layout=True)
-    ax.hist2d(cx, cy, bins=600, cmax=10, cmin=0)
-    ax.set_aspect("equal")
-    plt.savefig("hist2d.png", dpi=300)
-
-    _fig, ax = plt.subplots(1, 2, figsize=(12, 6), tight_layout=True)
-    ax[0].hist(cx, bins=600)
-    ax[1].hist(cy, bins=600)
-    plt.savefig("hist1d.png", dpi=200)
-
-
-def plot_targets_txt():
-    """
-    Plots histograms of object detection targets from 'targets.txt', saving the figure as 'targets.jpg'.
-
-    Example: from utils.plots import *; plot_targets_txt()
-    """
-    x = np.loadtxt("targets.txt", dtype=np.float32).T
-    s = ["x targets", "y targets", "width targets", "height targets"]
-    _fig, ax = plt.subplots(2, 2, figsize=(8, 8), tight_layout=True)
-    ax = ax.ravel()
-    for i in range(4):
-        ax[i].hist(x[i], bins=100, label=f"{x[i].mean():.3g} +/- {x[i].std():.3g}")
-        ax[i].legend()
-        ax[i].set_title(s[i])
-    plt.savefig("targets.jpg", dpi=200)
-
-
 def plot_val_study(file="", dir="", x=None):
-    """
-    Plots validation study results from 'study*.txt' files in a directory or a specific file, comparing model
+    """Plots validation study results from 'study*.txt' files in a directory or a specific file, comparing model
     performance and speed.
 
     Example: from utils.plots import *; plot_val_study()
@@ -320,7 +166,7 @@ def plot_val_study(file="", dir="", x=None):
     ax2.set_ylabel("COCO AP val")
     ax2.legend(loc="lower right")
     f = save_dir / "study.png"
-    print(f"Saving {f}...")
+    LOGGER.info(f"Saving {f}...")
     plt.savefig(f, dpi=300)
 
 
@@ -333,7 +179,7 @@ def plot_labels(labels, names=(), save_dir=Path("")):
     x = pd.DataFrame(b.transpose(), columns=["x", "y", "width", "height"])
 
     # seaborn correlogram
-    sn.pairplot(x, corner=True, diag_kind="auto", kind="hist", diag_kws=dict(bins=50), plot_kws=dict(pmax=0.9))
+    sn.pairplot(x, corner=True, diag_kind="auto", kind="hist", diag_kws={"bins": 50}, plot_kws={"pmax": 0.9})
     plt.savefig(save_dir / "labels_correlogram.jpg", dpi=200)
     plt.close()
 
@@ -375,12 +221,10 @@ def imshow_cls(im, labels=None, pred=None, names=None, nmax=25, verbose=False, f
     from utils.augmentations import denormalize
 
     names = names or [f"class{i}" for i in range(1000)]
-    blocks = torch.chunk(
-        denormalize(im.clone()).cpu().float(), len(im), dim=0
-    )  # select batch index 0, block by channels
+    blocks = torch.chunk(denormalize(im.clone()).cpu().float(), len(im), dim=0)  # split batch into individual images
     n = min(len(blocks), nmax)  # number of plots
     m = min(8, round(n**0.5))  # 8 x 8 default
-    _fig, ax = plt.subplots(math.ceil(n / m), m)  # 8 rows x n/8 cols
+    _fig, ax = plt.subplots(math.ceil(n / m), m)
     ax = ax.ravel() if m > 1 else [ax]
     # plt.subplots_adjust(wspace=0.05, hspace=0.05)
     for i in range(n):
@@ -401,8 +245,7 @@ def imshow_cls(im, labels=None, pred=None, names=None, nmax=25, verbose=False, f
 
 
 def plot_evolve(evolve_csv="path/to/evolve.csv"):
-    """
-    Plots hyperparameter evolution results from a given CSV, saving the plot and displaying best results.
+    """Plots hyperparameter evolution results from a given CSV, saving the plot and displaying best results.
 
     Example: from utils.plots import *; plot_evolve()
     """
@@ -413,27 +256,26 @@ def plot_evolve(evolve_csv="path/to/evolve.csv"):
     f = fitness(x)
     j = np.argmax(f)  # max fitness index
     plt.figure(figsize=(10, 12), tight_layout=True)
-    matplotlib.rc("font", **{"size": 8})
-    print(f"Best results from row {j} of {evolve_csv}:")
+    matplotlib.rc("font", size=8)
+    LOGGER.info(f"Best results from row {j} of {evolve_csv}:")
     for i, k in enumerate(keys[7:]):
         v = x[:, 7 + i]
         mu = v[j]  # best single result
         plt.subplot(6, 5, i + 1)
         plt.scatter(v, f, c=hist2d(v, f, 20), cmap="viridis", alpha=0.8, edgecolors="none")
         plt.plot(mu, f.max(), "k+", markersize=15)
-        plt.title(f"{k} = {mu:.3g}", fontdict={"size": 9})  # limit to 40 characters
+        plt.title(f"{k} = {mu:.3g}", fontdict={"size": 9})
         if i % 5 != 0:
             plt.yticks([])
-        print(f"{k:>15}: {mu:.3g}")
+        LOGGER.info(f"{k:>15}: {mu:.3g}")
     f = evolve_csv.with_suffix(".png")  # filename
     plt.savefig(f, dpi=200)
     plt.close()
-    print(f"Saved {f}")
+    LOGGER.info(f"Saved {f}")
 
 
 def plot_results(file="path/to/results.csv", dir=""):
-    """
-    Plots training results from a 'results.csv' file; accepts file path and directory as arguments.
+    """Plots training results from a 'results.csv' file; accepts file path and directory as arguments.
 
     Example: from utils.plots import *; plot_results('path/to/results.csv')
     """
@@ -460,58 +302,3 @@ def plot_results(file="path/to/results.csv", dir=""):
     ax[1].legend()
     fig.savefig(save_dir / "results.png", dpi=200)
     plt.close()
-
-
-def profile_idetection(start=0, stop=0, labels=(), save_dir=""):
-    """
-    Plots per-image iDetection logs, comparing metrics like storage and performance over time.
-
-    Example: from utils.plots import *; profile_idetection()
-    """
-    ax = plt.subplots(2, 4, figsize=(12, 6), tight_layout=True)[1].ravel()
-    s = ["Images", "Free Storage (GB)", "RAM Usage (GB)", "Battery", "dt_raw (ms)", "dt_smooth (ms)", "real-world FPS"]
-    files = list(Path(save_dir).glob("frames*.txt"))
-    for fi, f in enumerate(files):
-        try:
-            results = np.loadtxt(f, ndmin=2).T[:, 90:-30]  # clip first and last rows
-            n = results.shape[1]  # number of rows
-            x = np.arange(start, min(stop, n) if stop else n)
-            results = results[:, x]
-            t = results[0] - results[0].min()  # set t0=0s
-            results[0] = x
-            for i, a in enumerate(ax):
-                if i < len(results):
-                    label = labels[fi] if len(labels) else f.stem.replace("frames_", "")
-                    a.plot(t, results[i], marker=".", label=label, linewidth=1, markersize=5)
-                    a.set_title(s[i])
-                    a.set_xlabel("time (s)")
-                    # if fi == len(files) - 1:
-                    #     a.set_ylim(bottom=0)
-                    for side in ["top", "right"]:
-                        a.spines[side].set_visible(False)
-                else:
-                    a.remove()
-        except Exception as e:
-            print(f"Warning: Plotting error for {f}; {e}")
-    ax[1].legend()
-    plt.savefig(Path(save_dir) / "idetection_profile.png", dpi=200)
-
-
-def save_one_box(xyxy, im, file=Path("im.jpg"), gain=1.02, pad=10, square=False, BGR=False, save=True):
-    """Crops and saves an image from bounding box `xyxy`, applied with `gain` and `pad`, optionally squares and adjusts
-    for BGR.
-    """
-    xyxy = torch.tensor(xyxy).view(-1, 4)
-    b = xyxy2xywh(xyxy)  # boxes
-    if square:
-        b[:, 2:] = b[:, 2:].max(1)[0].unsqueeze(1)  # attempt rectangle to square
-    b[:, 2:] = b[:, 2:] * gain + pad  # box wh * gain + pad
-    xyxy = xywh2xyxy(b).long()
-    clip_boxes(xyxy, im.shape)
-    crop = im[int(xyxy[0, 1]) : int(xyxy[0, 3]), int(xyxy[0, 0]) : int(xyxy[0, 2]), :: (1 if BGR else -1)]
-    if save:
-        file.parent.mkdir(parents=True, exist_ok=True)  # make directory
-        f = str(increment_path(file).with_suffix(".jpg"))
-        # cv2.imwrite(f, crop)  # save BGR, https://github.com/ultralytics/yolov5/issues/7007 chroma subsampling issue
-        Image.fromarray(crop[..., ::-1]).save(f, quality=95, subsampling=0)  # save RGB
-    return crop

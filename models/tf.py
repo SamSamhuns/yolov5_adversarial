@@ -24,8 +24,8 @@ if str(ROOT) not in sys.path:
 import numpy as np
 import tensorflow as tf
 import torch
-import torch.nn as nn
 from tensorflow import keras
+from torch import nn
 
 from models.common import (
     C3,
@@ -42,7 +42,7 @@ from models.common import (
     Focus,
     autopad,
 )
-from models.experimental import MixConv2d, attempt_load
+from models.experimental import attempt_load
 from models.yolo import Detect, Segment
 from utils.activations import SiLU
 from utils.general import LOGGER, make_divisible, print_args
@@ -71,11 +71,8 @@ class TFPad(keras.layers.Layer):
     """Pads input tensors in spatial dimensions 1 and 2 with specified integer or tuple padding values."""
 
     def __init__(self, pad):
-        """
-        Initializes a padding layer for spatial dimensions 1 and 2 with specified padding, supporting both int and tuple
-        inputs.
-
-        Inputs are
+        """Initializes a padding layer for spatial dimensions 1 and 2 with specified padding, supporting both int and
+        tuple inputs.
         """
         super().__init__()
         if isinstance(pad, int):
@@ -92,14 +89,13 @@ class TFConv(keras.layers.Layer):
     """Implements a standard convolutional layer with optional batch normalization and activation for TensorFlow."""
 
     def __init__(self, c1, c2, k=1, s=1, p=None, g=1, act=True, w=None):
-        """
-        Initializes a standard convolution layer with optional batch normalization and activation; supports only
+        """Initializes a standard convolution layer with optional batch normalization and activation; supports only
         group=1.
 
-        Inputs are ch_in, ch_out, weights, kernel, stride, padding, groups.
+        Inputs are ch_in, ch_out, kernel, stride, padding, groups, act, weights.
         """
         super().__init__()
-        assert g == 1, "TF v2.2 Conv2D does not support 'groups' argument"
+        assert g == 1, "grouped convolutions are not supported in TF export"
         # TensorFlow convolution padding is inconsistent with PyTorch (e.g. k=3 s=2 'SAME' padding)
         # see https://stackoverflow.com/questions/52975843/comparing-conv2d-with-padding-between-tensorflow-and-pytorch
         conv = keras.layers.Conv2D(
@@ -124,11 +120,10 @@ class TFDWConv(keras.layers.Layer):
     """Initializes a depthwise convolution layer with optional batch normalization and activation for TensorFlow."""
 
     def __init__(self, c1, c2, k=1, s=1, p=None, act=True, w=None):
-        """
-        Initializes a depthwise convolution layer with optional batch normalization and activation for TensorFlow
+        """Initializes a depthwise convolution layer with optional batch normalization and activation for TensorFlow
         models.
 
-        Input are ch_in, ch_out, weights, kernel, stride, padding, groups.
+        Inputs are ch_in, ch_out, kernel, stride, padding, act, weights.
         """
         super().__init__()
         assert c2 % c1 == 0, f"TFDWConv() output={c2} must be a multiple of input={c1} channels"
@@ -154,14 +149,13 @@ class TFDWConvTranspose2d(keras.layers.Layer):
     """Implements a depthwise ConvTranspose2D layer for TensorFlow with specific settings."""
 
     def __init__(self, c1, c2, k=1, s=1, p1=0, p2=0, w=None):
-        """
-        Initializes depthwise ConvTranspose2D layer with specific channel, kernel, stride, and padding settings.
+        """Initializes depthwise ConvTranspose2D layer with specific channel, kernel, stride, and padding settings.
 
-        Inputs are ch_in, ch_out, weights, kernel, stride, padding, groups.
+        Inputs are ch_in, ch_out, kernel, stride, pad1, pad2, weights.
         """
         super().__init__()
-        assert c1 == c2, f"TFDWConv() output={c2} must be equal to input={c1} channels"
-        assert k == 4 and p1 == 1, "TFDWConv() only valid for k=4 and p1=1"
+        assert c1 == c2, f"TFDWConvTranspose2d() output={c2} must be equal to input={c1} channels"
+        assert k == 4 and p1 == 1, "TFDWConvTranspose2d() only valid for k=4 and p1=1"
         weight, bias = w.weight.permute(2, 3, 1, 0).numpy(), w.bias.numpy()
         self.c1 = c1
         self.conv = [
@@ -187,18 +181,16 @@ class TFFocus(keras.layers.Layer):
     """Focuses spatial information into channel space using pixel shuffling and convolution for TensorFlow models."""
 
     def __init__(self, c1, c2, k=1, s=1, p=None, g=1, act=True, w=None):
-        """
-        Initializes TFFocus layer to focus width and height information into channel space with custom convolution
+        """Initializes TFFocus layer to focus width and height information into channel space with custom convolution
         parameters.
 
-        Inputs are ch_in, ch_out, kernel, stride, padding, groups.
+        Inputs are ch_in, ch_out, kernel, stride, padding, groups, act, weights.
         """
         super().__init__()
         self.conv = TFConv(c1 * 4, c2, k, s, p, g, act, w.conv)
 
     def call(self, inputs):
-        """
-        Performs pixel shuffling and convolution on input tensor, downsampling by 2 and expanding channels by 4.
+        """Performs pixel shuffling and convolution on input tensor, downsampling by 2 and expanding channels by 4.
 
         Example x(b,w,h,c) -> y(b,w/2,h/2,4c).
         """
@@ -210,9 +202,8 @@ class TFBottleneck(keras.layers.Layer):
     """Implements a TensorFlow bottleneck layer with optional shortcut connections for efficient feature extraction."""
 
     def __init__(self, c1, c2, shortcut=True, g=1, e=0.5, w=None):
-        """
-        Initializes a standard bottleneck layer for TensorFlow models, expanding and contracting channels with optional
-        shortcut.
+        """Initializes a standard bottleneck layer for TensorFlow models, expanding and contracting channels with
+        optional shortcut.
 
         Arguments are ch_in, ch_out, shortcut, groups, expansion.
         """
@@ -253,7 +244,7 @@ class TFConv2d(keras.layers.Layer):
         sizes and stride.
         """
         super().__init__()
-        assert g == 1, "TF v2.2 Conv2D does not support 'groups' argument"
+        assert g == 1, "grouped convolutions are not supported in TF export"
         self.conv = keras.layers.Conv2D(
             filters=c2,
             kernel_size=k,
@@ -273,8 +264,7 @@ class TFBottleneckCSP(keras.layers.Layer):
     """Implements a CSP bottleneck layer for TensorFlow models to enhance gradient flow and efficiency."""
 
     def __init__(self, c1, c2, n=1, shortcut=True, g=1, e=0.5, w=None):
-        """
-        Initializes CSP bottleneck layer with specified channel sizes, count, shortcut option, groups, and expansion
+        """Initializes CSP bottleneck layer with specified channel sizes, count, shortcut option, groups, and expansion
         ratio.
 
         Inputs are ch_in, ch_out, number, shortcut, groups, expansion.
@@ -302,8 +292,7 @@ class TFC3(keras.layers.Layer):
     """CSP bottleneck layer with 3 convolutions for TensorFlow, supporting optional shortcuts and group convolutions."""
 
     def __init__(self, c1, c2, n=1, shortcut=True, g=1, e=0.5, w=None):
-        """
-        Initializes CSP Bottleneck with 3 convolutions, supporting optional shortcuts and group convolutions.
+        """Initializes CSP Bottleneck with 3 convolutions, supporting optional shortcuts and group convolutions.
 
         Inputs are ch_in, ch_out, number, shortcut, groups, expansion.
         """
@@ -315,8 +304,7 @@ class TFC3(keras.layers.Layer):
         self.m = keras.Sequential([TFBottleneck(c_, c_, shortcut, g, e=1.0, w=w.m[j]) for j in range(n)])
 
     def call(self, inputs):
-        """
-        Processes input through a sequence of transformations for object detection (YOLOv5).
+        """Processes input through a sequence of transformations for object detection (YOLOv5).
 
         See https://github.com/ultralytics/yolov5.
         """
@@ -327,8 +315,7 @@ class TFC3x(keras.layers.Layer):
     """A TensorFlow layer for enhanced feature extraction using cross-convolutions in object detection models."""
 
     def __init__(self, c1, c2, n=1, shortcut=True, g=1, e=0.5, w=None):
-        """
-        Initializes layer with cross-convolutions for enhanced feature extraction in object detection models.
+        """Initializes layer with cross-convolutions for enhanced feature extraction in object detection models.
 
         Inputs are ch_in, ch_out, number, shortcut, groups, expansion.
         """
@@ -367,9 +354,7 @@ class TFSPPF(keras.layers.Layer):
     """Implements a fast spatial pyramid pooling layer for TensorFlow with optimized feature extraction."""
 
     def __init__(self, c1, c2, k=5, w=None):
-        """Initializes a fast spatial pyramid pooling layer with customizable in/out channels, kernel size, and
-        weights.
-        """
+        """Initialize a fast spatial pyramid pooling layer with customizable channels, kernel size, and weights."""
         super().__init__()
         c_ = c1 // 2  # hidden channels
         self.cv1 = TFConv(c1, c_, 1, 1, w=w.cv1)
@@ -403,7 +388,6 @@ class TFDetect(keras.layers.Layer):
         self.anchors = tf.convert_to_tensor(w.anchors.numpy(), dtype=tf.float32)
         self.anchor_grid = tf.reshape(self.anchors * tf.reshape(self.stride, [self.nl, 1, 1]), [self.nl, 1, -1, 1, 2])
         self.m = [TFConv2d(x, self.no * self.na, 1, w=w.m[i]) for i, x in enumerate(ch)]
-        self.training = False  # set to False after building model
         self.imgsz = imgsz
         for i in range(self.nl):
             ny, nx = self.imgsz[0] // self.stride[i], self.imgsz[1] // self.stride[i]
@@ -419,19 +403,19 @@ class TFDetect(keras.layers.Layer):
             ny, nx = self.imgsz[0] // self.stride[i], self.imgsz[1] // self.stride[i]
             x[i] = tf.reshape(x[i], [-1, ny * nx, self.na, self.no])
 
-            if not self.training:  # inference
-                y = x[i]
-                grid = tf.transpose(self.grid[i], [0, 2, 1, 3]) - 0.5
-                anchor_grid = tf.transpose(self.anchor_grid[i], [0, 2, 1, 3]) * 4
-                xy = (tf.sigmoid(y[..., 0:2]) * 2 + grid) * self.stride[i]  # xy
-                wh = tf.sigmoid(y[..., 2:4]) ** 2 * anchor_grid
-                # Normalize xywh to 0-1 to reduce calibration error
-                xy /= tf.constant([[self.imgsz[1], self.imgsz[0]]], dtype=tf.float32)
-                wh /= tf.constant([[self.imgsz[1], self.imgsz[0]]], dtype=tf.float32)
-                y = tf.concat([xy, wh, tf.sigmoid(y[..., 4 : 5 + self.nc]), y[..., 5 + self.nc :]], -1)
-                z.append(tf.reshape(y, [-1, self.na * ny * nx, self.no]))
+            # Inference
+            y = x[i]
+            grid = tf.transpose(self.grid[i], [0, 2, 1, 3]) - 0.5
+            anchor_grid = tf.transpose(self.anchor_grid[i], [0, 2, 1, 3]) * 4
+            xy = (tf.sigmoid(y[..., 0:2]) * 2 + grid) * self.stride[i]  # xy
+            wh = tf.sigmoid(y[..., 2:4]) ** 2 * anchor_grid
+            # Normalize xywh to 0-1 to reduce calibration error
+            xy /= tf.constant([[self.imgsz[1], self.imgsz[0]]], dtype=tf.float32)
+            wh /= tf.constant([[self.imgsz[1], self.imgsz[0]]], dtype=tf.float32)
+            y = tf.concat([xy, wh, tf.sigmoid(y[..., 4 : 5 + self.nc]), y[..., 5 + self.nc :]], -1)
+            z.append(tf.reshape(y, [-1, self.na * ny * nx, self.no]))
 
-        return tf.transpose(x, [0, 2, 1, 3]) if self.training else (tf.concat(z, 1),)
+        return (tf.concat(z, 1),)
 
     @staticmethod
     def _make_grid(nx=20, ny=20):
@@ -457,21 +441,19 @@ class TFSegment(TFDetect):
         self.detect = TFDetect.call
 
     def call(self, x):
-        """Applies detection and proto layers on input, returning detections and optionally protos if training."""
+        """Applies detection and proto layers on input, returning detections and prototype masks."""
         p = self.proto(x[0])
         # p = TFUpsample(None, scale_factor=4, mode='nearest')(self.proto(x[0]))  # (optional) full-size protos
         p = tf.transpose(p, [0, 3, 1, 2])  # from shape(1,160,160,32) to shape(1,32,160,160)
         x = self.detect(self, x)
-        return (x, p) if self.training else (x[0], p)
+        return (x[0], p)
 
 
 class TFProto(keras.layers.Layer):
     """Implements convolutional and upsampling layers for feature extraction in YOLOv5 segmentation."""
 
     def __init__(self, c1, c_=256, c2=32, w=None):
-        """Initializes TFProto layer with convolutional and upsampling layers for feature extraction and
-        transformation.
-        """
+        """Initialize TFProto layer with convolutional and upsampling for feature extraction and transformation."""
         super().__init__()
         self.cv1 = TFConv(c1, c_, k=3, w=w.cv1)
         self.upsample = TFUpsample(None, scale_factor=2, mode="nearest")
@@ -487,9 +469,8 @@ class TFUpsample(keras.layers.Layer):
     """Implements a TensorFlow upsampling layer with specified size, scale factor, and interpolation mode."""
 
     def __init__(self, size, scale_factor, mode, w=None):
-        """
-        Initializes a TensorFlow upsampling layer with specified size, scale_factor, and mode, ensuring scale_factor is
-        even.
+        """Initializes a TensorFlow upsampling layer with specified size, scale_factor, and mode, ensuring scale_factor
+        is even.
 
         Warning: all arguments needed including 'w'
         """
@@ -554,7 +535,6 @@ def parse_model(d, ch, model, imgsz):
             Bottleneck,
             SPP,
             SPPF,
-            MixConv2d,
             Focus,
             CrossConv,
             BottleneckCSP,
@@ -604,9 +584,7 @@ class TFModel:
     """Implements YOLOv5 model in TensorFlow, supporting TensorFlow, Keras, and TFLite formats for object detection."""
 
     def __init__(self, cfg="yolov5s.yaml", ch=3, nc=None, model=None, imgsz=(640, 640)):
-        """Initializes TF YOLOv5 model with specified configuration, channels, classes, model instance, and input
-        size.
-        """
+        """Initialize TF YOLOv5 model with specified channels, classes, model instance, and input size."""
         super().__init__()
         if isinstance(cfg, dict):
             self.yaml = cfg  # model dict
@@ -658,17 +636,10 @@ class TFModel:
                 )
             return (nms,)
         return x  # output [1,6300,85] = [xywh, conf, class0, class1, ...]
-        # x = x[0]  # [x(1,6300,85), ...] to x(6300,85)
-        # xywh = x[..., :4]  # x(6300,4) boxes
-        # conf = x[..., 4:5]  # x(6300,1) confidences
-        # cls = tf.reshape(tf.cast(tf.argmax(x[..., 5:], axis=1), tf.float32), (-1, 1))  # x(6300,1)  classes
-        # return tf.concat([conf, cls, xywh], 1)
 
     @staticmethod
     def _xywh2xyxy(xywh):
-        """Converts bounding box format from [x, y, w, h] to [x1, y1, x2, y2], where xy1=top-left and xy2=bottom-
-        right.
-        """
+        """Convert box format from [x, y, w, h] to [x1, y1, x2, y2], where xy1=top-left and xy2=bottom-right."""
         x, y, w, h = tf.split(xywh, num_or_size_splits=4, axis=-1)
         return tf.concat([x - w / 2, y - h / 2, x + w / 2, y + h / 2], axis=-1)
 
@@ -730,13 +701,11 @@ def activations(act=nn.SiLU):
     elif isinstance(act, (nn.SiLU, SiLU)):
         return lambda x: keras.activations.swish(x)
     else:
-        raise Exception(f"no matching TensorFlow activation found for PyTorch activation {act}")
+        raise TypeError(f"no matching TensorFlow activation found for PyTorch activation {act}")
 
 
 def representative_dataset_gen(dataset, ncalib=100):
-    """Generates a representative dataset for calibration by yielding transformed numpy arrays from the input
-    dataset.
-    """
+    """Generate representative dataset for calibration by yielding transformed numpy arrays from the input dataset."""
     for n, (path, img, im0s, vid_cap, string) in enumerate(dataset):
         im = np.transpose(img, [1, 2, 0])
         im = np.expand_dims(im, axis=0).astype(np.float32)
@@ -752,8 +721,8 @@ def run(
     batch_size=1,  # batch size
     dynamic=False,  # dynamic batch size
 ):
-    # PyTorch model
     """Exports YOLOv5 model from PyTorch to TensorFlow and Keras formats, performing inference for validation."""
+    # PyTorch model
     im = torch.zeros((batch_size, 3, *imgsz))  # BCHW image
     model = attempt_load(weights, device=torch.device("cpu"), inplace=True, fuse=False)
     _ = model(im)  # inference

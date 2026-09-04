@@ -1,12 +1,13 @@
 # Ultralytics 🚀 AGPL-3.0 License - https://ultralytics.com/license
+"""Segmentation loss functions."""
 
 import torch
-import torch.nn as nn
 import torch.nn.functional as F
+from torch import nn
+from ultralytics.utils.metrics import bbox_iou, smooth_bce
 
 from ..general import xywh2xyxy
-from ..loss import FocalLoss, smooth_BCE
-from ..metrics import bbox_iou
+from ..loss import FocalLoss
 from ..torch_utils import de_parallel
 from .general import crop_mask
 
@@ -15,9 +16,7 @@ class ComputeLoss:
     """Computes the YOLOv5 model's loss components including classification, objectness, box, and mask losses."""
 
     def __init__(self, model, autobalance=False, overlap=False):
-        """Initializes the compute loss function for YOLOv5 models with options for autobalancing and overlap
-        handling.
-        """
+        """Initialize compute loss function for YOLOv5 models with options for autobalancing and overlap handling."""
         self.sort_obj_iou = False
         self.overlap = overlap
         device = next(model.parameters()).device  # get model device
@@ -28,7 +27,7 @@ class ComputeLoss:
         BCEobj = nn.BCEWithLogitsLoss(pos_weight=torch.tensor([h["obj_pw"]], device=device))
 
         # Class label smoothing https://arxiv.org/pdf/1902.04103.pdf eqn 3
-        self.cp, self.cn = smooth_BCE(eps=h.get("label_smoothing", 0.0))  # positive, negative BCE targets
+        self.cp, self.cn = smooth_bce(eps=h.get("label_smoothing", 0.0))  # positive, negative BCE targets
 
         # Focal loss
         g = h["fl_gamma"]  # focal loss gamma
@@ -46,7 +45,7 @@ class ComputeLoss:
         self.anchors = m.anchors
         self.device = device
 
-    def __call__(self, preds, targets, masks):  # predictions, targets, model
+    def __call__(self, preds, targets, masks):  # predictions, targets, masks
         """Evaluates YOLOv5 model's loss for given predictions, targets, and masks; returns total loss components."""
         p, proto = preds
         bs, nm, mask_h, mask_w = proto.shape  # batch size, number of masks, mask height, mask width
@@ -160,20 +159,19 @@ class ComputeLoss:
             gain[2:6] = torch.tensor(shape)[[3, 2, 3, 2]]  # xyxy gain
 
             # Match targets to anchors
-            t = targets * gain  # shape(3,n,7)
+            t = targets * gain  # shape(3,n,8)
             if nt:
                 # Matches
                 r = t[..., 4:6] / anchors[:, None]  # wh ratio
                 j = torch.max(r, 1 / r).max(2)[0] < self.hyp["anchor_t"]  # compare
-                # j = wh_iou(anchors, t[:, 4:6]) > model.hyp['iou_t']  # iou(3,n)=wh_iou(anchors(3,2), gwh(n,2))
                 t = t[j]  # filter
 
                 # Offsets
                 gxy = t[:, 2:4]  # grid xy
                 gxi = gain[[2, 3]] - gxy  # inverse
                 j, k = ((gxy % 1 < g) & (gxy > 1)).T
-                l, m = ((gxi % 1 < g) & (gxi > 1)).T
-                j = torch.stack((torch.ones_like(j), j, k, l, m))
+                left, right = ((gxi % 1 < g) & (gxi > 1)).T
+                j = torch.stack((torch.ones_like(j), j, k, left, right))
                 t = t.repeat((5, 1, 1))[j]
                 offsets = (torch.zeros_like(gxy)[None] + off[:, None])[j]
             else:

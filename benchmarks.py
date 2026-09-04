@@ -17,9 +17,9 @@ TensorFlow Edge TPU         | `edgetpu`                     | yolov5s_edgetpu.tf
 TensorFlow.js               | `tfjs`                        | yolov5s_web_model/
 
 Requirements:
-    $ pip install -r requirements.txt coremltools onnx onnx-simplifier onnxruntime openvino-dev tensorflow-cpu  # CPU
-    $ pip install -r requirements.txt coremltools onnx onnx-simplifier onnxruntime-gpu openvino-dev tensorflow  # GPU
-    $ pip install -U nvidia-tensorrt --index-url https://pypi.ngc.nvidia.com  # TensorRT
+    $ pip install -r requirements.txt coremltools onnx onnxslim onnxruntime openvino tensorflow-cpu  # CPU
+    $ pip install -r requirements.txt coremltools onnx onnxslim onnxruntime-gpu openvino tensorflow  # GPU
+    $ pip install -U tensorrt  # TensorRT
 
 Usage:
     $ python benchmarks.py --weights yolov5s.pt --img 640
@@ -43,7 +43,6 @@ import export
 from models.experimental import attempt_load
 from models.yolo import SegmentationModel
 from segment.val import run as val_seg
-from utils import notebook_init
 from utils.general import LOGGER, check_yaml, file_size, print_args
 from utils.torch_utils import select_device
 from val import run as val_det
@@ -60,8 +59,7 @@ def run(
     pt_only=False,  # test PyTorch only
     hard_fail=False,  # throw error on benchmark failure
 ):
-    """
-    Run YOLOv5 benchmarks on multiple export formats and log results for model performance evaluation.
+    """Run YOLOv5 benchmarks on multiple export formats and log results for model performance evaluation.
 
     Args:
         weights (Path | str): Path to the model weights file (default: ROOT / "yolov5s.pt").
@@ -75,26 +73,25 @@ def run(
         hard_fail (bool): Throw an error on benchmark failure if True (default: False).
 
     Returns:
-        None. Logs information about the benchmark results, including the format, size, mAP50-95, and inference time.
+        (pd.DataFrame): Benchmark results with columns for format, size, mAP50-95, and inference time.
+
+    Examples:
+        ```python
+        $ python benchmarks.py --weights yolov5s.pt --img 640
+        ```
+
+        Install required packages:
+          $ pip install -r requirements.txt coremltools onnx onnxslim onnxruntime openvino tensorflow-cpu  # CPU support
+          $ pip install -r requirements.txt coremltools onnx onnxslim onnxruntime-gpu openvino tensorflow   # GPU support
+          $ pip install -U tensorrt  # TensorRT
+
+        Run benchmarks:
+          $ python benchmarks.py --weights yolov5s.pt --img 640
 
     Notes:
         Supported export formats and models include PyTorch, TorchScript, ONNX, OpenVINO, TensorRT, CoreML,
             TensorFlow SavedModel, TensorFlow GraphDef, TensorFlow Lite, and TensorFlow Edge TPU. Edge TPU and TF.js
             are unsupported.
-
-    Example:
-        ```python
-        $ python benchmarks.py --weights yolov5s.pt --img 640
-        ```
-
-    Usage:
-        Install required packages:
-          $ pip install -r requirements.txt coremltools onnx onnx-simplifier onnxruntime openvino-dev tensorflow-cpu  # CPU support
-          $ pip install -r requirements.txt coremltools onnx onnx-simplifier onnxruntime-gpu openvino-dev tensorflow   # GPU support
-          $ pip install -U nvidia-tensorrt --index-url https://pypi.ngc.nvidia.com  # TensorRT
-
-        Run benchmarks:
-          $ python benchmarks.py --weights yolov5s.pt --img 640
     """
     y, t = [], time.time()
     device = select_device(device)
@@ -129,22 +126,19 @@ def run(
         except Exception as e:
             if hard_fail:
                 assert type(e) is AssertionError, f"Benchmark --hard-fail for {name}: {e}"
-            LOGGER.warning(f"WARNING ⚠️ Benchmark failure for {name}: {e}")
+            LOGGER.warning(f"Benchmark failure for {name}: {e}")
             y.append([name, None, None, None])  # mAP, t_inference
         if pt_only and i == 0:
             break  # break after PyTorch
 
     # Print results
     LOGGER.info("\n")
-    parse_opt()
-    notebook_init()  # print system info
-    c = ["Format", "Size (MB)", "mAP50-95", "Inference time (ms)"] if map else ["Format", "Export", "", ""]
-    py = pd.DataFrame(y, columns=c)
+    py = pd.DataFrame(y, columns=["Format", "Size (MB)", "mAP50-95", "Inference time (ms)"])
     LOGGER.info(f"\nBenchmarks complete ({time.time() - t:.2f}s)")
-    LOGGER.info(str(py if map else py.iloc[:, :2]))
+    LOGGER.info(str(py))
     if hard_fail and isinstance(hard_fail, str):
         metrics = py["mAP50-95"].array  # values to compare to floor
-        floor = eval(hard_fail)  # minimum metric floor to pass, i.e. = 0.29 mAP for YOLOv5n
+        floor = float(hard_fail)  # minimum metric floor to pass, i.e. = 0.29 mAP for YOLOv5n
         assert all(x > floor for x in metrics if pd.notna(x)), f"HARD FAIL: mAP50-95 < floor {floor}"
     return py
 
@@ -160,15 +154,16 @@ def test(
     pt_only=False,  # test PyTorch only
     hard_fail=False,  # throw error on benchmark failure
 ):
-    """
-    Run YOLOv5 export tests for all supported formats and log the results, including export statuses.
+    """Run YOLOv5 export tests for all supported formats and log the results, including export statuses.
 
     Args:
         weights (Path | str): Path to the model weights file (.pt format). Default is 'ROOT / "yolov5s.pt"'.
         imgsz (int): Inference image size (in pixels). Default is 640.
         batch_size (int): Batch size for testing. Default is 1.
-        data (Path | str): Path to the dataset configuration file (.yaml format). Default is 'ROOT / "data/coco128.yaml"'.
-        device (str): Device for running the tests, can be 'cpu' or a specific CUDA device ('0', '0,1,2,3', etc.). Default is an empty string.
+        data (Path | str): Path to the dataset configuration file (.yaml format). Default is 'ROOT /
+            "data/coco128.yaml"'.
+        device (str): Device for running the tests, can be 'cpu' or a specific CUDA device ('0', '0,1,2,3', etc.).
+            Default is an empty string.
         half (bool): Use FP16 half-precision for inference if True. Default is False.
         test (bool): Test export formats only without running inference. Default is False.
         pt_only (bool): Test only the PyTorch model if True. Default is False.
@@ -182,21 +177,20 @@ def test(
         $ python benchmarks.py --weights yolov5s.pt --img 640
         ```
 
+        Install required packages:
+            $ pip install -r requirements.txt coremltools onnx onnxslim onnxruntime openvino tensorflow-cpu  # CPU support
+            $ pip install -r requirements.txt coremltools onnx onnxslim onnxruntime-gpu openvino tensorflow   # GPU support
+            $ pip install -U tensorrt  # TensorRT
+        Run export tests:
+            $ python benchmarks.py --weights yolov5s.pt --img 640
+
     Notes:
         Supported export formats and models include PyTorch, TorchScript, ONNX, OpenVINO, TensorRT, CoreML, TensorFlow
         SavedModel, TensorFlow GraphDef, TensorFlow Lite, and TensorFlow Edge TPU. Edge TPU and TF.js are unsupported.
-
-    Usage:
-        Install required packages:
-            $ pip install -r requirements.txt coremltools onnx onnx-simplifier onnxruntime openvino-dev tensorflow-cpu  # CPU support
-            $ pip install -r requirements.txt coremltools onnx onnx-simplifier onnxruntime-gpu openvino-dev tensorflow   # GPU support
-            $ pip install -U nvidia-tensorrt --index-url https://pypi.ngc.nvidia.com  # TensorRT
-        Run export tests:
-            $ python benchmarks.py --weights yolov5s.pt --img 640
     """
     y, t = [], time.time()
     device = select_device(device)
-    for i, (name, f, suffix, gpu) in export.export_formats().iterrows():  # index, (name, file, suffix, gpu-capable)
+    for i, (name, f, suffix, cpu, gpu) in export.export_formats().iterrows():  # index, (name, file, suffix, CPU, GPU)
         try:
             w = (
                 weights
@@ -210,8 +204,6 @@ def test(
 
     # Print results
     LOGGER.info("\n")
-    parse_opt()
-    notebook_init()  # print system info
     py = pd.DataFrame(y, columns=["Format", "Export"])
     LOGGER.info(f"\nExports complete ({time.time() - t:.2f}s)")
     LOGGER.info(str(py))
@@ -219,8 +211,7 @@ def test(
 
 
 def parse_opt():
-    """
-    Parses command-line arguments for YOLOv5 model inference configuration.
+    """Parses command-line arguments for YOLOv5 model inference configuration.
 
     Args:
         weights (str): The path to the weights file. Defaults to 'ROOT / "yolov5s.pt"'.
@@ -258,17 +249,16 @@ def parse_opt():
 
 
 def main(opt):
-    """
-    Executes YOLOv5 benchmark tests or main training/inference routines based on the provided command-line arguments.
+    """Executes YOLOv5 benchmark tests or main training/inference routines based on the provided command-line arguments.
 
     Args:
-        opt (argparse.Namespace): Parsed command-line arguments including options for weights, image size, batch size, data
-            configuration, device, and other flags for inference settings.
+        opt (argparse.Namespace): Parsed command-line arguments including options for weights, image size, batch size,
+            data configuration, device, and other flags for inference settings.
 
     Returns:
         None: This function does not return any value. It leverages side-effects such as logging and running benchmarks.
 
-    Example:
+    Examples:
         ```python
         if __name__ == "__main__":
             opt = parse_opt()

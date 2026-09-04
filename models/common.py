@@ -3,24 +3,26 @@
 
 import ast
 import contextlib
+import ipaddress
 import json
 import math
 import platform
+import socket
 import warnings
 import zipfile
 from collections import OrderedDict, namedtuple
 from copy import copy
 from pathlib import Path
-from urllib.parse import urlparse
+from urllib.parse import urljoin, urlparse
 
 import cv2
 import numpy as np
 import pandas as pd
 import requests
 import torch
-import torch.nn as nn
 from PIL import Image
-from torch.cuda import amp
+from PIL.ImageOps import exif_transpose
+from torch import nn
 
 # Import 'ultralytics' package or install if missing
 try:
@@ -36,7 +38,7 @@ except (ImportError, AssertionError):
 from ultralytics.utils.plotting import Annotator, colors, save_one_box
 
 from utils import TryExcept
-from utils.dataloaders import exif_transpose, letterbox
+from utils.dataloaders import letterbox
 from utils.general import (
     LOGGER,
     ROOT,
@@ -54,12 +56,11 @@ from utils.general import (
     xyxy2xywh,
     yaml_load,
 )
-from utils.torch_utils import copy_attr, smart_inference_mode
+from utils.torch_utils import copy_attr, smart_amp_autocast, smart_inference_mode
 
 
 def autopad(k, p=None, d=1):
-    """
-    Pads kernel to 'same' output shape, adjusting for optional dilation; returns padding size.
+    """Pads kernel to 'same' output shape, adjusting for optional dilation; returns padding size.
 
     `k`: kernel, `p`: padding, `d`: dilation.
     """
@@ -115,10 +116,9 @@ class TransformerLayer(nn.Module):
     """Transformer layer with multihead attention and linear layers, optimized by removing LayerNorm."""
 
     def __init__(self, c, num_heads):
-        """
-        Initializes a transformer layer, sans LayerNorm for performance, with multihead attention and linear layers.
+        """Initializes a transformer layer, sans LayerNorm for performance, with multihead attention and linear layers.
 
-        See  as described in https://arxiv.org/abs/2010.11929.
+        As described in https://arxiv.org/abs/2010.11929 (ViT).
         """
         super().__init__()
         self.q = nn.Linear(c, c, bias=False)
@@ -211,8 +211,7 @@ class CrossConv(nn.Module):
     """Implements a cross convolution layer with downsampling, expansion, and optional shortcut."""
 
     def __init__(self, c1, c2, k=3, s=1, g=1, e=1.0, shortcut=False):
-        """
-        Initializes CrossConv with downsampling, expanding, and optionally shortcutting; `c1` input, `c2` output
+        """Initializes CrossConv with downsampling, expanding, and optionally shortcutting; `c1` input, `c2` output
         channels.
 
         Inputs are ch_in, ch_out, kernel, stride, groups, expansion, shortcut.
@@ -297,7 +296,9 @@ class SPP(nn.Module):
     """Implements Spatial Pyramid Pooling (SPP) for feature extraction, ref: https://arxiv.org/abs/1406.4729."""
 
     def __init__(self, c1, c2, k=(5, 9, 13)):
-        """Initializes SPP layer with Spatial Pyramid Pooling, ref: https://arxiv.org/abs/1406.4729, args: c1 (input channels), c2 (output channels), k (kernel sizes)."""
+        """Initializes SPP layer with Spatial Pyramid Pooling, ref: https://arxiv.org/abs/1406.4729, args: c1 (input
+        channels), c2 (output channels), k (kernel sizes).
+        """
         super().__init__()
         c_ = c1 // 2  # hidden channels
         self.cv1 = Conv(c1, c_, 1, 1)
@@ -318,8 +319,7 @@ class SPPF(nn.Module):
     """Implements a fast Spatial Pyramid Pooling (SPPF) layer for efficient feature extraction in YOLOv5 models."""
 
     def __init__(self, c1, c2, k=5):
-        """
-        Initializes YOLOv5 SPPF layer with given channels and kernel size for YOLOv5 model, combining convolution and
+        """Initializes YOLOv5 SPPF layer with given channels and kernel size for YOLOv5 model, combining convolution and
         max pooling.
 
         Equivalent to SPP(k=(5, 9, 13)).
@@ -379,7 +379,9 @@ class GhostBottleneck(nn.Module):
     """Efficient bottleneck layer using Ghost Convolutions, see https://github.com/huawei-noah/ghostnet."""
 
     def __init__(self, c1, c2, k=3, s=1):
-        """Initializes GhostBottleneck with ch_in `c1`, ch_out `c2`, kernel size `k`, stride `s`; see https://github.com/huawei-noah/ghostnet."""
+        """Initializes GhostBottleneck with ch_in `c1`, ch_out `c2`, kernel size `k`, stride `s`; see
+        https://github.com/huawei-noah/ghostnet.
+        """
         super().__init__()
         c_ = c2 // 2
         self.conv = nn.Sequential(
@@ -421,9 +423,8 @@ class Expand(nn.Module):
     """Expands spatial dimensions by redistributing channels, e.g., from (1,64,80,80) to (1,16,160,160)."""
 
     def __init__(self, gain=2):
-        """
-        Initializes the Expand module to increase spatial dimensions by redistributing channels, with an optional gain
-        factor.
+        """Initializes the Expand module to increase spatial dimensions by redistributing channels, with an optional
+        gain factor.
 
         Example: x(1,64,80,80) to x(1,16,160,160).
         """
@@ -431,9 +432,7 @@ class Expand(nn.Module):
         self.gain = gain
 
     def forward(self, x):
-        """Processes input tensor x to expand spatial dimensions by redistributing channels, requiring C / gain^2 ==
-        0.
-        """
+        """Processes input tensor x to expand spatial dims by redistributing channels, requiring C / gain^2 == 0."""
         b, c, h, w = x.size()  # assert C / s ** 2 == 0, 'Indivisible gain'
         s = self.gain
         x = x.view(b, s, s, c // s**2, h, w)  # x(1,2,2,16,80,80)
@@ -450,16 +449,14 @@ class Concat(nn.Module):
         self.d = dimension
 
     def forward(self, x):
-        """Concatenates a list of tensors along a specified dimension; `x` is a list of tensors, `dimension` is an
-        int.
-        """
+        """Concatenates a list of tensors along a specified dims; `x` is a list of tensors, `dimension` is an int."""
         return torch.cat(x, self.d)
 
 
 class DetectMultiBackend(nn.Module):
     """YOLOv5 MultiBackend class for inference on various backends including PyTorch, ONNX, TensorRT, and more."""
 
-    def __init__(self, weights="yolov5s.pt", device=torch.device("cpu"), dnn=False, data=None, fp16=False, fuse=True):
+    def __init__(self, weights="yolov5s.pt", device=torch.device("cpu"), dnn=False, data=None, fp16=False, fuse=True):  # noqa: B008
         """Initializes DetectMultiBackend with support for various inference backends, including PyTorch and ONNX."""
         #   PyTorch:              weights = *.pt
         #   TorchScript:                    *.torchscript
@@ -516,11 +513,11 @@ class DetectMultiBackend(nn.Module):
             output_names = [x.name for x in session.get_outputs()]
             meta = session.get_modelmeta().custom_metadata_map  # metadata
             if "stride" in meta:
-                stride, names = int(meta["stride"]), eval(meta["names"])
+                stride, names = int(meta["stride"]), ast.literal_eval(meta["names"])
         elif xml:  # OpenVINO
             LOGGER.info(f"Loading {w} for OpenVINO inference...")
-            check_requirements("openvino>=2023.0")  # requires openvino-dev: https://pypi.org/project/openvino-dev/
-            from openvino.runtime import Core, Layout, get_batch
+            check_requirements("openvino>=2024.0.0")
+            from openvino import Core, Layout, get_batch
 
             core = Core()
             if not Path(w).is_file():  # if not *.xml
@@ -544,6 +541,11 @@ class DetectMultiBackend(nn.Module):
             logger = trt.Logger(trt.Logger.INFO)
             with open(w, "rb") as f, trt.Runtime(logger) as runtime:
                 model = runtime.deserialize_cuda_engine(f.read())
+            if model is None:
+                raise RuntimeError(
+                    "TensorRT engine deserialization failed. Re-export the engine with the same TensorRT version, "
+                    "CUDA version, and GPU device used for inference."
+                )
             context = model.create_execution_context()
             bindings = OrderedDict()
             output_names = []
@@ -590,25 +592,17 @@ class DetectMultiBackend(nn.Module):
             LOGGER.info(f"Loading {w} for TensorFlow SavedModel inference...")
             import tensorflow as tf
 
-            keras = False  # assume TF1 saved_model
-            model = tf.keras.models.load_model(w) if keras else tf.saved_model.load(w)
+            model = tf.saved_model.load(w)
         elif pb:  # GraphDef https://www.tensorflow.org/guide/migrate#a_graphpb_or_graphpbtxt
             LOGGER.info(f"Loading {w} for TensorFlow GraphDef inference...")
             import tensorflow as tf
+            from ultralytics.utils.export.tensorflow import gd_outputs
 
             def wrap_frozen_graph(gd, inputs, outputs):
                 """Wraps a TensorFlow GraphDef for inference, returning a pruned function."""
                 x = tf.compat.v1.wrap_function(lambda: tf.compat.v1.import_graph_def(gd, name=""), [])  # wrapped
                 ge = x.graph.as_graph_element
                 return x.prune(tf.nest.map_structure(ge, inputs), tf.nest.map_structure(ge, outputs))
-
-            def gd_outputs(gd):
-                """Generates a sorted list of graph outputs excluding NoOp nodes and inputs, formatted as '<name>:0'."""
-                name_list, input_list = [], []
-                for node in gd.node:  # tensorflow.core.framework.node_def_pb2.NodeDef
-                    name_list.append(node.name)
-                    input_list.extend(node.input)
-                return sorted(f"{x}:0" for x in list(set(name_list) - set(input_list)) if not x.startswith("NoOp"))
 
             gd = tf.Graph().as_graph_def()  # TF GraphDef
             with open(w, "rb") as f:
@@ -637,11 +631,10 @@ class DetectMultiBackend(nn.Module):
             input_details = interpreter.get_input_details()  # inputs
             output_details = interpreter.get_output_details()  # outputs
             # load metadata
-            with contextlib.suppress(zipfile.BadZipFile):
-                with zipfile.ZipFile(w, "r") as model:
-                    meta_file = model.namelist()[0]
-                    meta = ast.literal_eval(model.read(meta_file).decode("utf-8"))
-                    stride, names = int(meta["stride"]), meta["names"]
+            with contextlib.suppress(zipfile.BadZipFile), zipfile.ZipFile(w, "r") as model:
+                meta_file = model.namelist()[0]
+                meta = ast.literal_eval(model.read(meta_file).decode("utf-8"))
+                stride, names = int(meta["stride"]), meta["names"]
         elif tfjs:  # TF.js
             raise NotImplementedError("ERROR: YOLOv5 TF.js inference is not supported")
         # PaddlePaddle
@@ -666,6 +659,7 @@ class DetectMultiBackend(nn.Module):
             config = pdi.Config(str(model_file), str(params_file))
             if cuda:
                 config.enable_use_gpu(memory_pool_init_size_mb=2048, device_id=0)
+            config.disable_mkldnn()  # disable MKL-DNN for PIR compatibility
             predictor = pdi.create_predictor(config)
             input_handle = predictor.get_input_handle(predictor.get_input_names()[0])
             output_names = predictor.get_output_names()
@@ -688,8 +682,8 @@ class DetectMultiBackend(nn.Module):
 
         self.__dict__.update(locals())  # assign all variables to self
 
-    def forward(self, im, augment=False, visualize=False):
-        """Performs YOLOv5 inference on input images with options for augmentation and visualization."""
+    def forward(self, im, augment=False):
+        """Performs YOLOv5 inference on input images with optional augmentation."""
         _b, _ch, h, w = im.shape  # batch, channel, height, width
         if self.fp16 and im.dtype != torch.float16:
             im = im.half()  # to FP16
@@ -697,7 +691,7 @@ class DetectMultiBackend(nn.Module):
             im = im.permute(0, 2, 3, 1)  # torch BCHW to numpy BHWC shape(1,320,192,3)
 
         if self.pt:  # PyTorch
-            y = self.model(im, augment=augment, visualize=visualize) if augment or visualize else self.model(im)
+            y = self.model(im, augment=augment) if augment else self.model(im)
         elif self.jit:  # TorchScript
             y = self.model(im)
         elif self.dnn:  # ONNX OpenCV DNN
@@ -712,12 +706,20 @@ class DetectMultiBackend(nn.Module):
             y = list(self.ov_compiled_model(im).values())
         elif self.engine:  # TensorRT
             if self.dynamic and im.shape != self.bindings["images"].shape:
-                i = self.model.get_binding_index("images")
-                self.context.set_binding_shape(i, im.shape)  # reshape if dynamic
-                self.bindings["images"] = self.bindings["images"]._replace(shape=im.shape)
-                for name in self.output_names:
-                    i = self.model.get_binding_index(name)
-                    self.bindings[name].data.resize_(tuple(self.context.get_binding_shape(i)))
+                if self.is_trt10:  # TensorRT>=10 tensor API
+                    self.context.set_input_shape("images", im.shape)  # reshape if dynamic
+                    self.bindings["images"] = self.bindings["images"]._replace(shape=im.shape)
+                    for name in self.output_names:
+                        self.bindings[name].data.resize_(tuple(self.context.get_tensor_shape(name)))
+                        self.binding_addrs[name] = int(self.bindings[name].data.data_ptr())  # refresh after resize_
+                else:  # TensorRT<10 binding API
+                    i = self.model.get_binding_index("images")
+                    self.context.set_binding_shape(i, im.shape)  # reshape if dynamic
+                    self.bindings["images"] = self.bindings["images"]._replace(shape=im.shape)
+                    for name in self.output_names:
+                        i = self.model.get_binding_index(name)
+                        self.bindings[name].data.resize_(tuple(self.context.get_binding_shape(i)))
+                        self.binding_addrs[name] = int(self.bindings[name].data.data_ptr())  # refresh after resize_
             s = self.bindings["images"].shape
             assert im.shape == s, f"input size {im.shape} {'>' if self.dynamic else 'not equal to'} max model size {s}"
             self.binding_addrs["images"] = int(im.data_ptr())
@@ -730,7 +732,7 @@ class DetectMultiBackend(nn.Module):
             y = self.model.predict({"image": im})  # coordinates are xywh normalized
             if "confidence" in y:
                 box = xywh2xyxy(y["coordinates"] * [[w, h, w, h]])  # xyxy pixels
-                conf, cls = y["confidence"].max(1), y["confidence"].argmax(1).astype(np.float)
+                conf, cls = y["confidence"].max(1), y["confidence"].argmax(1).astype(float)
                 y = np.concatenate((box, conf.reshape(-1, 1), cls.reshape(-1, 1)), 1)
             else:
                 y = list(reversed(y.values()))  # reversed for segmentation models (pred, proto)
@@ -744,7 +746,7 @@ class DetectMultiBackend(nn.Module):
         else:  # TensorFlow (SavedModel, GraphDef, Lite, Edge TPU)
             im = im.cpu().numpy()
             if self.saved_model:  # SavedModel
-                y = self.model(im, training=False) if self.keras else self.model(im)
+                y = self.model(im)
             elif self.pb:  # GraphDef
                 y = self.frozen_func(x=self.tf.constant(im))
             else:  # Lite or Edge TPU
@@ -781,13 +783,12 @@ class DetectMultiBackend(nn.Module):
         warmup_types = self.pt, self.jit, self.onnx, self.engine, self.saved_model, self.pb, self.triton
         if any(warmup_types) and (self.device.type != "cpu" or self.triton):
             im = torch.empty(*imgsz, dtype=torch.half if self.fp16 else torch.float, device=self.device)  # input
-            for _ in range(2 if self.jit else 1):  #
+            for _ in range(2 if self.jit else 1):
                 self.forward(im)  # warmup
 
     @staticmethod
     def _model_type(p="path/to/model.pt"):
-        """
-        Determines model type from file path or URL, supporting various export formats.
+        """Determines model type from file path or URL, supporting various export formats.
 
         Example: path='path/to/model.onnx' -> type=onnx
         """
@@ -811,6 +812,32 @@ class DetectMultiBackend(nn.Module):
             d = yaml_load(f)
             return d["stride"], d["names"]  # assign stride, names
         return None, None
+
+
+def _validate_ssrf_url(url: str) -> None:
+    """Raise ValueError if url resolves to any private/internal address."""
+    hostname = urlparse(url).hostname or ""
+    try:
+        results = socket.getaddrinfo(hostname, None)
+    except socket.gaierror as e:
+        raise ValueError(f"Could not resolve hostname '{hostname}': {e}") from e
+    for _family, _type, _proto, _canonname, sockaddr in results:
+        addr = ipaddress.ip_address(sockaddr[0])
+        if addr.is_private or addr.is_loopback or addr.is_link_local or addr.is_reserved or addr.is_multicast:
+            raise ValueError(f"Blocked request to internal address: {addr}")
+
+
+def _request_ssrf_url(url: str, max_redirects: int = 5):
+    """Fetch a URL after validating each resolved redirect target."""
+    session = requests.Session()
+    for _ in range(max_redirects + 1):
+        _validate_ssrf_url(url)
+        response = session.get(url, stream=True, allow_redirects=False)
+        if not response.is_redirect:
+            return response
+        url = urljoin(response.url, response.headers["location"])
+        response.close()
+    raise ValueError(f"Too many redirects while fetching {url}")
 
 
 class AutoShape(nn.Module):
@@ -839,12 +866,8 @@ class AutoShape(nn.Module):
             m.export = True  # do not output loss values
 
     def _apply(self, fn):
-        """
-        Applies to(), cpu(), cuda(), half() etc.
-
-        to model tensors excluding parameters or registered buffers.
-        """
-        self = super()._apply(fn)
+        """Applies to(), cpu(), cuda(), half() etc. to model tensors, excluding parameters or registered buffers."""
+        super()._apply(fn)
         if self.pt:
             m = self.model.model.model[-1] if self.dmb else self.model.model[-1]  # Detect()
             m.stride = fn(m.stride)
@@ -855,8 +878,7 @@ class AutoShape(nn.Module):
 
     @smart_inference_mode()
     def forward(self, ims, size=640, augment=False, profile=False):
-        """
-        Performs inference on inputs with optional augment & profiling.
+        """Performs inference on inputs with optional augment & profiling.
 
         Supports various formats including file, URI, OpenCV, PIL, numpy, torch.
         """
@@ -876,7 +898,7 @@ class AutoShape(nn.Module):
             p = next(self.model.parameters()) if self.pt else torch.empty(1, device=self.model.device)  # param
             autocast = self.amp and (p.device.type != "cpu")  # Automatic Mixed Precision (AMP) inference
             if isinstance(ims, torch.Tensor):  # torch
-                with amp.autocast(autocast):
+                with smart_amp_autocast(autocast):
                     return self.model(ims.to(p.device).type_as(p), augment=augment)  # inference
 
             # Pre-process
@@ -885,7 +907,7 @@ class AutoShape(nn.Module):
             for i, im in enumerate(ims):
                 f = f"image{i}"  # filename
                 if isinstance(im, (str, Path)):  # filename or uri
-                    im, f = Image.open(requests.get(im, stream=True).raw if str(im).startswith("http") else im), im
+                    im, f = Image.open(_request_ssrf_url(str(im)).raw if str(im).startswith("http") else im), im
                     im = np.asarray(exif_transpose(im))
                 elif isinstance(im, Image.Image):  # PIL Image
                     im, f = np.asarray(exif_transpose(im)), getattr(im, "filename", f) or f
@@ -903,7 +925,7 @@ class AutoShape(nn.Module):
             x = np.ascontiguousarray(np.array(x).transpose((0, 3, 1, 2)))  # stack and BHWC to BCHW
             x = torch.from_numpy(x).to(p.device).type_as(p) / 255  # uint8 to fp16/32
 
-        with amp.autocast(autocast):
+        with smart_amp_autocast(autocast):
             # Inference
             with dt[1]:
                 y = self.model(x, augment=augment)  # forward
@@ -928,7 +950,7 @@ class AutoShape(nn.Module):
 class Detections:
     """Manages YOLOv5 detection results with methods for visualization, saving, cropping, and exporting detections."""
 
-    def __init__(self, ims, pred, files, times=(0, 0, 0), names=None, shape=None):
+    def __init__(self, ims, pred, files, times, names=None, shape=None):
         """Initializes the YOLOv5 Detections class with image info, predictions, filenames, timing and normalization."""
         super().__init__()
         d = pred[0].device  # device
@@ -1002,16 +1024,14 @@ class Detections:
 
     @TryExcept("Showing images is not supported in this environment")
     def show(self, labels=True):
-        """
-        Displays detection results with optional labels.
+        """Displays detection results with optional labels.
 
         Usage: show(labels=True)
         """
         self._run(show=True, labels=labels)  # show results
 
     def save(self, labels=True, save_dir="runs/detect/exp", exist_ok=False):
-        """
-        Saves detection results with optional labels to a specified directory.
+        """Saves detection results with optional labels to a specified directory.
 
         Usage: save(labels=True, save_dir='runs/detect/exp', exist_ok=False)
         """
@@ -1019,8 +1039,7 @@ class Detections:
         self._run(save=True, labels=labels, save_dir=save_dir)  # save results
 
     def crop(self, save=True, save_dir="runs/detect/exp", exist_ok=False):
-        """
-        Crops detection results, optionally saves them to a directory.
+        """Crops detection results, optionally saves them to a directory.
 
         Args: save (bool), save_dir (str), exist_ok (bool).
         """
@@ -1033,8 +1052,7 @@ class Detections:
         return self.ims
 
     def pandas(self):
-        """
-        Returns detections as pandas DataFrames for various box formats (xyxy, xyxyn, xywh, xywhn).
+        """Returns detections as pandas DataFrames for various box formats (xyxy, xyxyn, xywh, xywhn).
 
         Example: print(results.pandas().xyxy[0]).
         """
@@ -1047,8 +1065,7 @@ class Detections:
         return new
 
     def tolist(self):
-        """
-        Converts a Detections object into a list of individual detection results for iteration.
+        """Converts a Detections object into a list of individual detection results for iteration.
 
         Example: for result in results.tolist():
         """

@@ -6,10 +6,9 @@ import random
 import numpy as np
 import torch
 import yaml
-from tqdm import tqdm
 
 from utils import TryExcept
-from utils.general import LOGGER, TQDM_BAR_FORMAT, colorstr
+from utils.general import LOGGER, TQDM, colorstr
 
 PREFIX = colorstr("AutoAnchor: ")
 
@@ -19,18 +18,20 @@ def check_anchor_order(m):
     a = m.anchors.prod(-1).mean(-1).view(-1)  # mean anchor area per output layer
     da = a[-1] - a[0]  # delta a
     ds = m.stride[-1] - m.stride[0]  # delta s
-    if da and (da.sign() != ds.sign()):  # same order
+    if da and (da.sign() != ds.sign()):  # anchor order does not match stride order
         LOGGER.info(f"{PREFIX}Reversing anchor order")
         m.anchors[:] = m.anchors.flip(0)
 
 
-@TryExcept(f"{PREFIX}ERROR")
+@TryExcept(colorstr("AutoAnchor"))
 def check_anchors(dataset, model, thr=4.0, imgsz=640):
     """Evaluates anchor fit to dataset and adjusts if necessary, supporting customizable threshold and image size."""
     m = model.module.model[-1] if hasattr(model, "module") else model.model[-1]  # Detect()
     shapes = imgsz * dataset.shapes / dataset.shapes.max(1, keepdims=True)
     scale = np.random.uniform(0.9, 1.1, size=(shapes.shape[0], 1))  # augment scale
-    wh = torch.tensor(np.concatenate([l[:, 3:5] * s for s, l in zip(shapes * scale, dataset.labels)])).float()  # wh
+    wh = torch.tensor(
+        np.concatenate([label[:, 3:5] * shape for shape, label in zip(shapes * scale, dataset.labels)])
+    ).float()  # wh
 
     def metric(k):  # compute metric
         """Computes ratio metric, anchors above threshold, and best possible recall for YOLOv5 anchor evaluation."""
@@ -64,10 +65,9 @@ def check_anchors(dataset, model, thr=4.0, imgsz=640):
 
 
 def kmean_anchors(dataset="./data/coco128.yaml", n=9, img_size=640, thr=4.0, gen=1000, verbose=True):
-    """
-    Creates kmeans-evolved anchors from training dataset.
+    """Creates kmeans-evolved anchors from training dataset.
 
-    Arguments:
+    Args:
         dataset: path to data.yaml, or a loaded dataset
         n: number of anchors
         img_size: image size used for training
@@ -75,10 +75,10 @@ def kmean_anchors(dataset="./data/coco128.yaml", n=9, img_size=640, thr=4.0, gen
         gen: generations to evolve anchors using genetic algorithm
         verbose: print all results
 
-    Return:
+    Returns:
         k: kmeans evolved anchors
 
-    Usage:
+    Examples:
         from utils.autoanchor import *; _ = kmean_anchors()
     """
     from scipy.cluster.vq import kmeans
@@ -90,7 +90,6 @@ def kmean_anchors(dataset="./data/coco128.yaml", n=9, img_size=640, thr=4.0, gen
         """Computes ratio metric, anchors above threshold, and best possible recall for YOLOv5 anchor evaluation."""
         r = wh[:, None] / k[None]
         x = torch.min(r, 1 / r).min(2)[0]  # ratio metric
-        # x = wh_iou(wh, torch.tensor(k))  # iou metric
         return x, x.max(1)[0]  # x, best_x
 
     def anchor_fitness(k):  # mutation fitness
@@ -109,7 +108,7 @@ def kmean_anchors(dataset="./data/coco128.yaml", n=9, img_size=640, thr=4.0, gen
             f"past_thr={x[x > thr].mean():.3f}-mean: "
         )
         for x in k:
-            s += "%i,%i, " % (round(x[0]), round(x[1]))
+            s += f"{round(x[0])},{round(x[1])}, "
         if verbose:
             LOGGER.info(s[:-2])
         return k
@@ -123,12 +122,12 @@ def kmean_anchors(dataset="./data/coco128.yaml", n=9, img_size=640, thr=4.0, gen
 
     # Get label wh
     shapes = img_size * dataset.shapes / dataset.shapes.max(1, keepdims=True)
-    wh0 = np.concatenate([l[:, 3:5] * s for s, l in zip(shapes, dataset.labels)])  # wh
+    wh0 = np.concatenate([label[:, 3:5] * shape for shape, label in zip(shapes, dataset.labels)])  # wh
 
     # Filter
     i = (wh0 < 3.0).any(1).sum()
     if i:
-        LOGGER.info(f"{PREFIX}WARNING ⚠️ Extremely small objects found: {i} of {len(wh0)} labels are <3 pixels in size")
+        LOGGER.warning(f"{PREFIX}Extremely small objects found: {i} of {len(wh0)} labels are <3 pixels in size")
     wh = wh0[(wh0 >= 2.0).any(1)].astype(np.float32)  # filter > 2 pixels
     # wh = wh * (npr.rand(wh.shape[0], 1) * 0.9 + 0.1)  # multiply by random scale 0-1
 
@@ -140,26 +139,14 @@ def kmean_anchors(dataset="./data/coco128.yaml", n=9, img_size=640, thr=4.0, gen
         k = kmeans(wh / s, n, iter=30)[0] * s  # points
         assert n == len(k)  # kmeans may return fewer points than requested if wh is insufficient or too similar
     except Exception:
-        LOGGER.warning(f"{PREFIX}WARNING ⚠️ switching strategies from kmeans to random init")
+        LOGGER.warning(f"{PREFIX}switching strategies from kmeans to random init")
         k = np.sort(npr.rand(n * 2)).reshape(n, 2) * img_size  # random init
     wh, wh0 = (torch.tensor(x, dtype=torch.float32) for x in (wh, wh0))
     k = print_results(k, verbose=False)
 
-    # Plot
-    # k, d = [None] * 20, [None] * 20
-    # for i in tqdm(range(1, 21)):
-    #     k[i-1], d[i-1] = kmeans(wh / s, i)  # points, mean distance
-    # fig, ax = plt.subplots(1, 2, figsize=(14, 7), tight_layout=True)
-    # ax = ax.ravel()
-    # ax[0].plot(np.arange(1, 21), np.array(d) ** 2, marker='.')
-    # fig, ax = plt.subplots(1, 2, figsize=(14, 7))  # plot wh
-    # ax[0].hist(wh[wh[:, 0]<100, 0],400)
-    # ax[1].hist(wh[wh[:, 1]<100, 1],400)
-    # fig.savefig('wh.png', dpi=200)
-
     # Evolve
-    f, sh, mp, s = anchor_fitness(k), k.shape, 0.9, 0.1  # fitness, generations, mutation prob, sigma
-    pbar = tqdm(range(gen), bar_format=TQDM_BAR_FORMAT)  # progress bar
+    f, sh, mp, s = anchor_fitness(k), k.shape, 0.9, 0.1  # fitness, anchor shape, mutation prob, sigma
+    pbar = TQDM(range(gen))  # progress bar
     for _ in pbar:
         v = np.ones(sh)
         while (v == 1).all():  # mutate until a change occurs (prevent duplicates)

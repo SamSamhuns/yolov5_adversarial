@@ -1,21 +1,21 @@
-<a href="https://www.ultralytics.com/"><img src="https://raw.githubusercontent.com/ultralytics/assets/main/logo/Ultralytics_Logotype_Original.svg" width="320" alt="Ultralytics logo"></a>
+<a href="https://www.ultralytics.com"><img src="https://raw.githubusercontent.com/ultralytics/assets/main/logo/Ultralytics_Logotype_Original.svg" width="320" alt="Ultralytics logo"></a>
 
 <img src="https://cdn.comet.ml/img/notebook_logo.png">
 
 # Using Ultralytics YOLO With Comet
 
-Welcome to the guide for integrating [Ultralytics YOLO](https://github.com/ultralytics/yolov5) with [Comet](https://www.comet.com/site/)! Comet offers robust experiment tracking, model management, and visualization tools to enhance your [machine learning](https://www.ultralytics.com/glossary/machine-learning-ml) workflow. This guide explains how to leverage Comet for monitoring training, logging results, managing datasets, and optimizing hyperparameters for your YOLO models.
+This guide explains how to integrate [Ultralytics YOLO](https://github.com/ultralytics/yolov5) with [Comet](https://www.comet.com/site/) for monitoring training, logging results, managing datasets, and optimizing hyperparameters.
 
-[![Ultralytics Actions](https://github.com/ultralytics/velocity/actions/workflows/format.yml/badge.svg)](https://github.com/ultralytics/velocity/actions/workflows/format.yml)
+[![Ultralytics Actions](https://github.com/ultralytics/yolov5/actions/workflows/format.yml/badge.svg)](https://github.com/ultralytics/yolov5/actions/workflows/format.yml)
 [![Ultralytics Discord](https://img.shields.io/discord/1089800235347353640?logo=discord&logoColor=white&label=Discord&color=blue)](https://discord.com/invite/ultralytics)
-[![Ultralytics Forums](https://img.shields.io/discourse/users?server=https%3A%2F%2Fcommunity.ultralytics.com&logo=discourse&label=Forums&color=blue)](https://community.ultralytics.com/)
-[![Ultralytics Reddit](https://img.shields.io/reddit/subreddit-subscribers/ultralytics?style=flat&logo=reddit&logoColor=white&label=Reddit&color=blue)](https://reddit.com/r/ultralytics)
+[![Ultralytics Forums](https://img.shields.io/discourse/users?server=https%3A%2F%2Fcommunity.ultralytics.com&logo=discourse&label=Forums&color=blue)](https://community.ultralytics.com)
+[![Ultralytics Reddit](https://img.shields.io/reddit/subreddit-subscribers/ultralytics?style=flat&logo=reddit&logoColor=white&label=Reddit&color=blue)](https://www.reddit.com/r/ultralytics/)
 
 ## 🧪 About Comet
 
 [Comet](https://www.comet.com/site/) provides tools for data scientists, engineers, and teams to accelerate and optimize [deep learning](https://www.ultralytics.com/glossary/deep-learning-dl) and machine learning models.
 
-With Comet, you can track and visualize model metrics in real time, save [hyperparameters](https://docs.ultralytics.com/guides/hyperparameter-tuning/), datasets, and model checkpoints, and visualize predictions using Custom Panels. Comet ensures you never lose track of your work and makes sharing results and collaborating across teams seamless. For more details, see the [Comet Documentation](https://www.comet.com/docs/v2/).
+With Comet, you can track and visualize model metrics in real time, save [hyperparameters](https://docs.ultralytics.com/guides/hyperparameter-tuning), datasets, and model checkpoints, and visualize predictions using Custom Panels. For more details, see the [Comet Documentation](https://www.comet.com/docs/v2/).
 
 ## 🚀 Getting Started
 
@@ -41,7 +41,7 @@ You can configure Comet in two ways:
    export COMET_PROJECT_NAME=YOUR_COMET_PROJECT_NAME # Defaults to 'yolov5' if not set
    ```
 
-   Find your API key in your [Comet Account Settings](https://www.comet.com/site/).
+   Find your API key in your [Comet Account Settings](https://www.comet.com/account-settings/apiKeys).
 
 2. **Configuration File:**  
    Create a `.comet.config` file in your working directory:
@@ -54,14 +54,14 @@ You can configure Comet in two ways:
 
 ### Run the Training Script
 
-Run the YOLO [training script](https://docs.ultralytics.com/modes/train/). Comet will automatically log your run.
+Run the YOLO [training script](https://docs.ultralytics.com/modes/train). Comet will automatically log your run.
 
 ```shell
 # Train YOLO on COCO128 for 5 epochs
 python train.py --img 640 --batch 16 --epochs 5 --data coco128.yaml --weights yolov5s.pt
 ```
 
-Comet automatically logs hyperparameters, command-line arguments, and training/validation metrics. Visualize and analyze your runs in the Comet UI. For more details, see the [Ultralytics training documentation](https://docs.ultralytics.com/modes/train/).
+Comet automatically logs hyperparameters, command-line arguments, and training/validation metrics. Visualize and analyze your runs in the Comet UI. For more details, see the [Ultralytics training documentation](https://docs.ultralytics.com/modes/train).
 
 <img width="1920" alt="Comet UI showing YOLO training metrics" src="https://user-images.githubusercontent.com/26833433/202851203-164e94e1-2238-46dd-91f8-de020e9d6b41.png">
 
@@ -82,13 +82,13 @@ Comet automatically logs the following information by default:
 ### Metrics
 
 - **Losses:** Box Loss, Object Loss, Classification Loss (Training and Validation)
-- **Performance:** [mAP@0.5](https://www.ultralytics.com/glossary/mean-average-precision-map), mAP@0.5:0.95 (Validation). Learn more in the [YOLO Performance Metrics guide](https://docs.ultralytics.com/guides/yolo-performance-metrics/).
+- **Performance:** [mAP@0.5](https://www.ultralytics.com/glossary/mean-average-precision-map), mAP@0.5:0.95 (Validation). Learn more in the [YOLO Performance Metrics guide](https://docs.ultralytics.com/guides/yolo-performance-metrics).
 - **[Precision](https://www.ultralytics.com/glossary/precision) and [Recall](https://www.ultralytics.com/glossary/recall):** Validation data metrics
 
 ### Parameters
 
 - **Model Hyperparameters:** Configuration used for the model
-- **Command Line Arguments:** All arguments passed via the [CLI](https://docs.ultralytics.com/usage/cli/)
+- **Command Line Arguments:** All arguments passed via the [CLI](https://docs.ultralytics.com/usage/cli)
 
 ### Visualizations
 
@@ -108,7 +108,7 @@ export COMET_LOG_CONFUSION_MATRIX=false                     # Disable confusion 
 export COMET_MAX_IMAGE_UPLOADS=NUMBER                       # Max prediction images to log. Default: 100
 export COMET_LOG_PER_CLASS_METRICS=true                     # Log metrics per class. Default: false
 export COMET_DEFAULT_CHECKPOINT_FILENAME=checkpoint_file.pt # Checkpoint for resuming. Default: 'last.pt'
-export COMET_LOG_BATCH_LEVEL_METRICS=true                   # Log training metrics per batch. Default: false
+export COMET_LOG_BATCH_METRICS=true                         # Log training metrics per batch. Default: false
 export COMET_LOG_PREDICTIONS=true                           # Disable prediction logging if set to false. Default: true
 ```
 
@@ -181,7 +181,7 @@ Use [Comet Artifacts](https://www.comet.com/docs/v2/guides/artifacts/using-artif
 
 ### Uploading a Dataset
 
-Upload your dataset using the `--upload_dataset` flag. Ensure your dataset follows the structure described in the [Ultralytics Datasets documentation](https://docs.ultralytics.com/datasets/) and that your dataset config [YAML](https://www.ultralytics.com/glossary/yaml) file matches the format of `coco128.yaml` (see the [COCO128 dataset docs](https://docs.ultralytics.com/datasets/detect/coco128/)).
+Upload your dataset using the `--upload_dataset` flag. Ensure your dataset follows the structure described in the [Ultralytics Datasets documentation](https://docs.ultralytics.com/datasets) and that your dataset config [YAML](https://www.ultralytics.com/glossary/yaml) file matches the format of `coco128.yaml` (see the [COCO128 dataset docs](https://docs.ultralytics.com/datasets/detect/coco128)).
 
 ```shell
 python train.py \
@@ -211,6 +211,7 @@ To use a dataset stored in Comet Artifacts, update the `path` in your dataset YA
 path: "comet://WORKSPACE_NAME/ARTIFACT_NAME:ARTIFACT_VERSION_OR_ALIAS"
 train: images/train # Adjust subdirectory if needed
 val: images/val # Adjust subdirectory if needed
+
 
 # Other dataset configurations...
 ```
@@ -242,7 +243,7 @@ python train.py \
 
 ## 🔍 Hyperparameter Optimization (HPO)
 
-YOLO integrates with the [Comet Optimizer](https://www.comet.com/docs/v2/guides/optimizer/configure-optimizer/) for easy hyperparameter sweeps and visualization. This helps you find the best set of parameters for your model, a process often referred to as [Hyperparameter Tuning](https://docs.ultralytics.com/guides/hyperparameter-tuning/).
+YOLO integrates with the [Comet Optimizer](https://www.comet.com/docs/v2/guides/optimizer/configure-optimizer/) for easy hyperparameter sweeps and visualization. This helps you find the best set of parameters for your model, a process often referred to as [Hyperparameter Tuning](https://docs.ultralytics.com/guides/hyperparameter-tuning).
 
 ### Configuring an Optimizer Sweep
 
@@ -266,11 +267,11 @@ python utils/loggers/comet/hpo.py \
 
 ### Running a Sweep in Parallel
 
-Execute multiple sweep trials concurrently using the `comet optimizer` command:
+Execute multiple sweep trials concurrently using the `comet optimize` command:
 
 ```shell
-comet optimizer -j \
-  utils/loggers/comet/hpo.py NUM_WORKERS utils/loggers/comet/optimizer_config.json
+comet optimize -j NUM_WORKERS \
+  utils/loggers/comet/hpo.py utils/loggers/comet/optimizer_config.json
 ```
 
 Replace `NUM_WORKERS` with the desired number of parallel processes.
@@ -283,4 +284,4 @@ Comet offers various visualizations for analyzing sweep results, such as paralle
 
 ## 🤝 Contributing
 
-Contributions to enhance the YOLO-Comet integration are welcome! Please see the [Ultralytics Contributing Guide](https://docs.ultralytics.com/help/contributing/) for more information on how to get involved. Thank you for helping improve this integration!
+Contributions to enhance the YOLO-Comet integration are welcome! Please see the [Ultralytics Contributing Guide](https://docs.ultralytics.com/help/contributing) for more information on how to get involved. Thank you for helping improve this integration!

@@ -20,7 +20,7 @@ Usage - formats:
                                           yolov5s-seg.onnx               # ONNX Runtime or OpenCV DNN with --dnn
                                           yolov5s-seg_openvino_model     # OpenVINO
                                           yolov5s-seg.engine             # TensorRT
-                                          yolov5s-seg.mlmodel            # CoreML (macOS-only)
+                                          yolov5s-seg.mlpackage          # CoreML (macOS-only)
                                           yolov5s-seg_saved_model        # TensorFlow SavedModel
                                           yolov5s-seg.pb                 # TensorFlow GraphDef
                                           yolov5s-seg.tflite             # TensorFlow Lite
@@ -42,6 +42,7 @@ if str(ROOT) not in sys.path:
     sys.path.append(str(ROOT))  # add ROOT to PATH
 ROOT = Path(os.path.relpath(ROOT, Path.cwd()))  # relative
 
+from ultralytics.utils.ops import masks2segments
 from ultralytics.utils.plotting import Annotator, colors, save_one_box
 
 from models.common import DetectMultiBackend
@@ -62,7 +63,7 @@ from utils.general import (
     scale_segments,
     strip_optimizer,
 )
-from utils.segment.general import masks2segments, process_mask, process_mask_native
+from utils.segment.general import process_mask, process_mask_native
 from utils.torch_utils import select_device, smart_inference_mode
 
 
@@ -84,7 +85,6 @@ def run(
     classes=None,  # filter by class: --class 0, or --class 0 2 3
     agnostic_nms=False,  # class-agnostic NMS
     augment=False,  # augmented inference
-    visualize=False,  # visualize features
     update=False,  # update all models
     project=ROOT / "runs/predict-seg",  # save results to project/name
     name="exp",  # save results to project/name
@@ -130,7 +130,7 @@ def run(
     vid_path, vid_writer = [None] * bs, [None] * bs
 
     # Run inference
-    model.warmup(imgsz=(1 if pt else bs, 3, *imgsz))  # warmup
+    model.warmup(imgsz=(1 if pt or model.triton else bs, 3, *imgsz))  # warmup
     seen, windows, dt = 0, [], (Profile(device=device), Profile(device=device), Profile(device=device))
     for path, im, im0s, vid_cap, s in dataset:
         with dt[0]:
@@ -142,15 +142,11 @@ def run(
 
         # Inference
         with dt[1]:
-            visualize = increment_path(save_dir / Path(path).stem, mkdir=True) if visualize else False
-            pred, proto = model(im, augment=augment, visualize=visualize)[:2]
+            pred, proto = model(im, augment=augment)[:2]
 
         # NMS
         with dt[2]:
             pred = non_max_suppression(pred, conf_thres, iou_thres, classes, agnostic_nms, max_det=max_det, nm=32)
-
-        # Second-stage classifier (optional)
-        # pred = utils.general.apply_classifier(pred, classifier_model, im, im0s)
 
         # Process predictions
         for i, det in enumerate(pred):  # per image
@@ -180,7 +176,7 @@ def run(
                 if save_txt:
                     segments = [
                         scale_segments(im0.shape if retina_masks else im.shape[2:], x, im0.shape, normalize=True)
-                        for x in reversed(masks2segments(masks))
+                        for x in reversed(masks2segments(masks, strategy="largest"))
                     ]
 
                 # Print results
@@ -189,14 +185,7 @@ def run(
                     s += f"{n} {names[int(c)]}{'s' * (n > 1)}, "  # add to string
 
                 # Mask plotting
-                annotator.masks(
-                    masks,
-                    colors=[colors(x, True) for x in det[:, 5]],
-                    im_gpu=torch.as_tensor(im0, dtype=torch.float16).to(device).permute(2, 0, 1).flip(0).contiguous()
-                    / 255
-                    if retina_masks
-                    else im[i],
-                )
+                annotator.masks(masks, colors=[colors(x, True) for x in det[:, 5]])
 
                 # Write results
                 for j, (*xyxy, conf, cls) in enumerate(reversed(det[:, :6])):
@@ -223,7 +212,7 @@ def run(
                     cv2.resizeWindow(str(p), im0.shape[1], im0.shape[0])
                 cv2.imshow(str(p), im0)
                 if cv2.waitKey(1) == ord("q"):  # 1 millisecond
-                    exit()
+                    sys.exit()
 
             # Save results (image with detections)
             if save_img:
@@ -254,7 +243,9 @@ def run(
         s = f"\n{len(list(save_dir.glob('labels/*.txt')))} labels saved to {save_dir / 'labels'}" if save_txt else ""
         LOGGER.info(f"Results saved to {colorstr('bold', save_dir)}{s}")
     if update:
-        strip_optimizer(weights[0])  # update model (to fix SourceChangeWarning)
+        strip_optimizer(
+            weights[0] if isinstance(weights, (list, tuple)) else weights
+        )  # update model (to fix SourceChangeWarning)
 
 
 def parse_opt():
@@ -278,7 +269,6 @@ def parse_opt():
     parser.add_argument("--classes", nargs="+", type=int, help="filter by class: --classes 0, or --classes 0 2 3")
     parser.add_argument("--agnostic-nms", action="store_true", help="class-agnostic NMS")
     parser.add_argument("--augment", action="store_true", help="augmented inference")
-    parser.add_argument("--visualize", action="store_true", help="visualize features")
     parser.add_argument("--update", action="store_true", help="update all models")
     parser.add_argument("--project", default=ROOT / "runs/predict-seg", help="save results to project/name")
     parser.add_argument("--name", default="exp", help="save results to project/name")
@@ -298,7 +288,7 @@ def parse_opt():
 
 def main(opt):
     """Executes YOLOv5 model inference with given options, checking for requirements before launching."""
-    check_requirements(ROOT / "requirements.txt", exclude=("tensorboard", "thop"))
+    check_requirements(ROOT / "requirements.txt", exclude=("tensorboard", "ultralytics-thop"))
     run(**vars(opt))
 
 

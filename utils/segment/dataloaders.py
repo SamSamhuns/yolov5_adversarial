@@ -4,18 +4,18 @@
 import os
 import random
 
-import cv2
 import numpy as np
 import torch
 from torch.utils.data import DataLoader
+from ultralytics.data.utils import polygons2masks, polygons2masks_overlap
 
 from ..augmentations import augment_hsv, copy_paste, letterbox
-from ..dataloaders import InfiniteDataLoader, LoadImagesAndLabels, SmartDistributedSampler, seed_worker
+from ..dataloaders import PIN_MEMORY, InfiniteDataLoader, LoadImagesAndLabels, SmartDistributedSampler, seed_worker
 from ..general import LOGGER, xyn2xy, xywhn2xyxy, xyxy2xywhn
 from ..torch_utils import torch_distributed_zero_first
 from .augmentations import mixup, random_perspective
 
-RANK = int(os.getenv("RANK", -1))
+RANK = int(os.getenv("RANK", "-1"))
 
 
 def create_dataloader(
@@ -41,7 +41,7 @@ def create_dataloader(
 ):
     """Creates a dataloader for training, validating, or testing YOLO models with various dataset options."""
     if rect and shuffle:
-        LOGGER.warning("WARNING ⚠️ --rect is incompatible with DataLoader shuffle, setting shuffle=False")
+        LOGGER.warning("--rect is incompatible with DataLoader shuffle, setting shuffle=False")
         shuffle = False
     with torch_distributed_zero_first(rank):  # init dataset *.cache only once if DDP
         dataset = LoadImagesAndLabelsAndMasks(
@@ -76,7 +76,7 @@ def create_dataloader(
         num_workers=nw,
         sampler=sampler,
         drop_last=quad,
-        pin_memory=True,
+        pin_memory=PIN_MEMORY,
         collate_fn=LoadImagesAndLabelsAndMasks.collate_fn4 if quad else LoadImagesAndLabelsAndMasks.collate_fn,
         worker_init_fn=seed_worker,
         generator=generator,
@@ -132,7 +132,7 @@ class LoadImagesAndLabelsAndMasks(LoadImagesAndLabels):  # for training/testing
         index = self.indices[index]  # linear, shuffled, or image_weights
 
         hyp = self.hyp
-        if mosaic := self.mosaic and random.random() < hyp["mosaic"]:
+        if self.mosaic and random.random() < hyp["mosaic"]:
             # Load mosaic
             img, labels, segments = self.load_mosaic(index)
             shapes = None
@@ -222,8 +222,6 @@ class LoadImagesAndLabelsAndMasks(LoadImagesAndLabels):  # for training/testing
                     labels[:, 1] = 1 - labels[:, 1]
                     masks = torch.flip(masks, dims=[2])
 
-            # Cutouts  # labels = cutout(img, labels, p=0.5)
-
         labels_out = torch.zeros((nl, 6))
         if nl:
             labels_out[:, 1:] = torch.from_numpy(labels)
@@ -241,10 +239,10 @@ class LoadImagesAndLabelsAndMasks(LoadImagesAndLabels):  # for training/testing
         yc, xc = (int(random.uniform(-x, 2 * s + x)) for x in self.mosaic_border)  # mosaic center x, y
 
         # 3 additional image indices
-        indices = [index] + random.choices(self.indices, k=3)  # 3 additional image indices
-        for i, index in enumerate(indices):
+        indices = [index, *random.choices(self.indices, k=3)]  # 3 additional image indices
+        for i, mosaic_index in enumerate(indices):
             # Load image
-            img, _, (h, w) = self.load_image(index)
+            img, _, (h, w) = self.load_image(mosaic_index)
 
             # place img in img4
             if i == 0:  # top left
@@ -265,7 +263,7 @@ class LoadImagesAndLabelsAndMasks(LoadImagesAndLabels):  # for training/testing
             padw = x1a - x1b
             padh = y1a - y1b
 
-            labels, segments = self.labels[index].copy(), self.segments[index].copy()
+            labels, segments = self.labels[mosaic_index].copy(), self.segments[mosaic_index].copy()
 
             if labels.size:
                 labels[:, 1:] = xywhn2xyxy(labels[:, 1:], w, h, padw, padh)  # normalized xywh to pixel xyxy format
@@ -277,7 +275,6 @@ class LoadImagesAndLabelsAndMasks(LoadImagesAndLabels):  # for training/testing
         labels4 = np.concatenate(labels4, 0)
         for x in (labels4[:, 1:], *segments4):
             np.clip(x, 0, 2 * s, out=x)  # clip when using random_perspective()
-        # img4, labels4 = replicate(img4, labels4)  # replicate
 
         # Augment
         img4, labels4, segments4 = copy_paste(img4, labels4, segments4, p=self.hyp["copy_paste"])
@@ -299,68 +296,6 @@ class LoadImagesAndLabelsAndMasks(LoadImagesAndLabels):  # for training/testing
         """Custom collation function for DataLoader, batches images, labels, paths, shapes, and segmentation masks."""
         img, label, path, shapes, masks = zip(*batch)  # transposed
         batched_masks = torch.cat(masks, 0)
-        for i, l in enumerate(label):
-            l[:, 0] = i  # add target image index for build_targets()
+        for i, labels in enumerate(label):
+            labels[:, 0] = i  # add target image index for build_targets()
         return torch.stack(img, 0), torch.cat(label, 0), path, shapes, batched_masks
-
-
-def polygon2mask(img_size, polygons, color=1, downsample_ratio=1):
-    """
-    Args:
-        img_size (tuple): The image size.
-        polygons (np.ndarray): [N, M], N is the number of polygons,
-            M is the number of points(Be divided by 2).
-    """
-    mask = np.zeros(img_size, dtype=np.uint8)
-    polygons = np.asarray(polygons)
-    polygons = polygons.astype(np.int32)
-    shape = polygons.shape
-    polygons = polygons.reshape(shape[0], -1, 2)
-    cv2.fillPoly(mask, polygons, color=color)
-    nh, nw = (img_size[0] // downsample_ratio, img_size[1] // downsample_ratio)
-    # NOTE: fillPoly firstly then resize is trying the keep the same way
-    # of loss calculation when mask-ratio=1.
-    mask = cv2.resize(mask, (nw, nh))
-    return mask
-
-
-def polygons2masks(img_size, polygons, color, downsample_ratio=1):
-    """
-    Args:
-        img_size (tuple): The image size.
-        polygons (list[np.ndarray]): each polygon is [N, M],
-            N is the number of polygons,
-            M is the number of points(Be divided by 2).
-    """
-    masks = []
-    for si in range(len(polygons)):
-        mask = polygon2mask(img_size, [polygons[si].reshape(-1)], color, downsample_ratio)
-        masks.append(mask)
-    return np.array(masks)
-
-
-def polygons2masks_overlap(img_size, segments, downsample_ratio=1):
-    """Return a (640, 640) overlap mask."""
-    masks = np.zeros(
-        (img_size[0] // downsample_ratio, img_size[1] // downsample_ratio),
-        dtype=np.int32 if len(segments) > 255 else np.uint8,
-    )
-    areas = []
-    ms = []
-    for si in range(len(segments)):
-        mask = polygon2mask(
-            img_size,
-            [segments[si].reshape(-1)],
-            downsample_ratio=downsample_ratio,
-            color=1,
-        )
-        ms.append(mask)
-        areas.append(mask.sum())
-    areas = np.asarray(areas)
-    index = np.argsort(-areas)
-    ms = np.array(ms)[index]
-    for i in range(len(segments)):
-        mask = ms[i] * (i + 1)
-        masks = masks + mask
-        masks = np.clip(masks, a_min=0, a_max=i + 1)
-    return masks, index

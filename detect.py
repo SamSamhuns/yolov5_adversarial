@@ -33,6 +33,7 @@ import csv
 import os
 import platform
 import sys
+from glob import glob, has_magic
 from pathlib import Path
 
 import torch
@@ -86,7 +87,6 @@ def run(
     classes=None,  # filter by class: --class 0, or --class 0 2 3
     agnostic_nms=False,  # class-agnostic NMS
     augment=False,  # augmented inference
-    visualize=False,  # visualize features
     update=False,  # update all models
     project=ROOT / "runs/detect",  # save results to project/name
     name="exp",  # save results to project/name
@@ -98,8 +98,7 @@ def run(
     dnn=False,  # use OpenCV DNN for ONNX inference
     vid_stride=1,  # video frame-rate stride
 ):
-    """
-    Runs YOLOv5 detection inference on various sources like images, videos, directories, streams, etc.
+    """Runs YOLOv5 detection inference on various sources like images, videos, directories, streams, etc.
 
     Args:
         weights (str | Path): Path to the model weights file or a Triton URL. Default is 'yolov5s.pt'.
@@ -110,10 +109,11 @@ def run(
         conf_thres (float): Confidence threshold for detections. Default is 0.25.
         iou_thres (float): Intersection Over Union (IOU) threshold for non-max suppression. Default is 0.45.
         max_det (int): Maximum number of detections per image. Default is 1000.
-        device (str): CUDA device identifier (e.g., '0' or '0,1,2,3') or 'cpu'. Default is an empty string, which uses the
-            best available device.
+        device (str): CUDA device identifier (e.g., '0' or '0,1,2,3') or 'cpu'. Default is an empty string, which uses
+            the best available device.
         view_img (bool): If True, display inference results using OpenCV. Default is False.
         save_txt (bool): If True, save results in a text file. Default is False.
+        save_format (int): Save boxes in YOLO (0) or Pascal-VOC (1) format when save_txt is set. Default is 0.
         save_csv (bool): If True, save results in a CSV file. Default is False.
         save_conf (bool): If True, include confidence scores in the saved results. Default is False.
         save_crop (bool): If True, save cropped prediction boxes. Default is False.
@@ -121,12 +121,11 @@ def run(
         classes (list[int]): List of class indices to filter detections by. Default is None.
         agnostic_nms (bool): If True, perform class-agnostic non-max suppression. Default is False.
         augment (bool): If True, use augmented inference. Default is False.
-        visualize (bool): If True, visualize feature maps. Default is False.
         update (bool): If True, update all models' weights. Default is False.
         project (str | Path): Directory to save results. Default is 'runs/detect'.
         name (str): Name of the current experiment; used to create a subdirectory within 'project'. Default is 'exp'.
-        exist_ok (bool): If True, existing directories with the same name are reused instead of being incremented. Default is
-            False.
+        exist_ok (bool): If True, existing directories with the same name are reused instead of being incremented.
+            Default is False.
         line_thickness (int): Thickness of bounding box lines in pixels. Default is 3.
         hide_labels (bool): If True, do not display labels on bounding boxes. Default is False.
         hide_conf (bool): If True, do not display confidence scores on bounding boxes. Default is False.
@@ -139,7 +138,7 @@ def run(
 
     Examples:
         ```python
-        from ultralytics import run
+        from detect import run
 
         # Run inference on an image
         run(source='data/images/example.jpg', weights='yolov5s.pt', device='0')
@@ -149,11 +148,18 @@ def run(
         ```
     """
     source = str(source)
-    save_img = not nosave and not source.endswith(".txt")  # save inference images
     is_file = Path(source).suffix[1:] in (IMG_FORMATS + VID_FORMATS)
     is_url = source.lower().startswith(("rtsp://", "rtmp://", "http://", "https://"))
     webcam = source.isnumeric() or source.endswith(".streams") or (is_url and not is_file)
     screenshot = source.lower().startswith("screen")
+
+    if not (webcam or screenshot or is_url) and not (
+        Path(source).exists() or (has_magic(source) and glob(source, recursive=True))
+    ):
+        raise FileNotFoundError(f"Source path '{source}' does not exist")
+
+    save_img = not nosave and not source.endswith(".txt")  # save inference images
+
     if is_url and is_file:
         source = check_file(source)  # download
 
@@ -179,6 +185,19 @@ def run(
         dataset = LoadImages(source, img_size=imgsz, stride=stride, auto=pt, vid_stride=vid_stride)
     vid_path, vid_writer = [None] * bs, [None] * bs
 
+    # Define the path for the CSV file
+    csv_path = save_dir / "predictions.csv"
+
+    def write_to_csv(image_name, prediction, confidence):
+        """Writes prediction data for an image to a CSV file, appending if the file exists."""
+        data = {"Image Name": image_name, "Prediction": prediction, "Confidence": confidence}
+        file_exists = os.path.isfile(csv_path)
+        with open(csv_path, mode="a", newline="") as f:
+            writer = csv.DictWriter(f, fieldnames=data.keys())
+            if not file_exists:
+                writer.writeheader()
+            writer.writerow(data)
+
     # Run inference
     model.warmup(imgsz=(1 if pt or model.triton else bs, 3, *imgsz))  # warmup
     seen, windows, dt = 0, [], (Profile(device=device), Profile(device=device), Profile(device=device))
@@ -194,37 +213,19 @@ def run(
 
         # Inference
         with dt[1]:
-            visualize = increment_path(save_dir / Path(path).stem, mkdir=True) if visualize else False
             if model.xml and im.shape[0] > 1:
                 pred = None
                 for image in ims:
                     if pred is None:
-                        pred = model(image, augment=augment, visualize=visualize).unsqueeze(0)
+                        pred = model(image, augment=augment).unsqueeze(0)
                     else:
-                        pred = torch.cat((pred, model(image, augment=augment, visualize=visualize).unsqueeze(0)), dim=0)
+                        pred = torch.cat((pred, model(image, augment=augment).unsqueeze(0)), dim=0)
                 pred = [pred, None]
             else:
-                pred = model(im, augment=augment, visualize=visualize)
+                pred = model(im, augment=augment)
         # NMS
         with dt[2]:
             pred = non_max_suppression(pred, conf_thres, iou_thres, classes, agnostic_nms, max_det=max_det)
-
-        # Second-stage classifier (optional)
-        # pred = utils.general.apply_classifier(pred, classifier_model, im, im0s)
-
-        # Define the path for the CSV file
-        csv_path = save_dir / "predictions.csv"
-
-        # Create or append to the CSV file
-        def write_to_csv(image_name, prediction, confidence):
-            """Writes prediction data for an image to a CSV file, appending if the file exists."""
-            data = {"Image Name": image_name, "Prediction": prediction, "Confidence": confidence}
-            file_exists = os.path.isfile(csv_path)
-            with open(csv_path, mode="a", newline="") as f:
-                writer = csv.DictWriter(f, fieldnames=data.keys())
-                if not file_exists:
-                    writer.writeheader()
-                writer.writerow(data)
 
         # Process predictions
         for i, det in enumerate(pred):  # per image
@@ -254,7 +255,7 @@ def run(
                 # Write results
                 for *xyxy, conf, cls in reversed(det):
                     c = int(cls)  # integer class
-                    label = names[c] if hide_conf else f"{names[c]}"
+                    label = names[c]
                     confidence = float(conf)
                     confidence_str = f"{confidence:.2f}"
 
@@ -318,12 +319,13 @@ def run(
         s = f"\n{len(list(save_dir.glob('labels/*.txt')))} labels saved to {save_dir / 'labels'}" if save_txt else ""
         LOGGER.info(f"Results saved to {colorstr('bold', save_dir)}{s}")
     if update:
-        strip_optimizer(weights[0])  # update model (to fix SourceChangeWarning)
+        strip_optimizer(
+            weights[0] if isinstance(weights, (list, tuple)) else weights
+        )  # update model (to fix SourceChangeWarning)
 
 
 def parse_opt():
-    """
-    Parse command-line arguments for YOLOv5 detection, allowing custom inference options and model configurations.
+    """Parse command-line arguments for YOLOv5 detection, allowing custom inference options and model configurations.
 
     Args:
         --weights (str | list[str], optional): Model path or Triton URL. Defaults to ROOT / 'yolov5s.pt'.
@@ -336,14 +338,15 @@ def parse_opt():
         --device (str, optional): CUDA device, i.e., '0' or '0,1,2,3' or 'cpu'. Defaults to "".
         --view-img (bool, optional): Flag to display results. Defaults to False.
         --save-txt (bool, optional): Flag to save results to *.txt files. Defaults to False.
+        --save-format (int): Save boxes in YOLO (0) or Pascal-VOC (1) format when --save-txt is set. Defaults to 0.
         --save-csv (bool, optional): Flag to save results in CSV format. Defaults to False.
         --save-conf (bool, optional): Flag to save confidences in labels saved via --save-txt. Defaults to False.
         --save-crop (bool, optional): Flag to save cropped prediction boxes. Defaults to False.
         --nosave (bool, optional): Flag to prevent saving images/videos. Defaults to False.
-        --classes (list[int], optional): List of classes to filter results by, e.g., '--classes 0 2 3'. Defaults to None.
+        --classes (list[int], optional): List of classes to filter results by, e.g., '--classes 0 2 3'. Defaults to
+            None.
         --agnostic-nms (bool, optional): Flag for class-agnostic NMS. Defaults to False.
         --augment (bool, optional): Flag for augmented inference. Defaults to False.
-        --visualize (bool, optional): Flag for visualizing features. Defaults to False.
         --update (bool, optional): Flag to update all models in the model directory. Defaults to False.
         --project (str, optional): Directory to save results. Defaults to ROOT / 'runs/detect'.
         --name (str, optional): Sub-directory name for saving results within --project. Defaults to 'exp'.
@@ -359,10 +362,10 @@ def parse_opt():
     Returns:
         argparse.Namespace: Parsed command-line arguments as an argparse.Namespace object.
 
-    Example:
+    Examples:
         ```python
-        from ultralytics import YOLOv5
-        args = YOLOv5.parse_opt()
+        from detect import parse_opt
+        opt = parse_opt()
         ```
     """
     parser = argparse.ArgumentParser()
@@ -389,7 +392,6 @@ def parse_opt():
     parser.add_argument("--classes", nargs="+", type=int, help="filter by class: --classes 0, or --classes 0 2 3")
     parser.add_argument("--agnostic-nms", action="store_true", help="class-agnostic NMS")
     parser.add_argument("--augment", action="store_true", help="augmented inference")
-    parser.add_argument("--visualize", action="store_true", help="visualize features")
     parser.add_argument("--update", action="store_true", help="update all models")
     parser.add_argument("--project", default=ROOT / "runs/detect", help="save results to project/name")
     parser.add_argument("--name", default="exp", help="save results to project/name")
@@ -407,8 +409,7 @@ def parse_opt():
 
 
 def main(opt):
-    """
-    Executes YOLOv5 model inference based on provided command-line arguments, validating dependencies before running.
+    """Executes YOLOv5 model inference based on provided command-line arguments, validating dependencies before running.
 
     Args:
         opt (argparse.Namespace): Command-line arguments for YOLOv5 detection. See function `parse_opt` for details.
@@ -416,7 +417,7 @@ def main(opt):
     Returns:
         None
 
-    Note:
+    Notes:
         This function performs essential pre-execution checks and initiates the YOLOv5 detection process based on user-specified
         options. Refer to the usage guide and examples for more information about different sources and formats at:
         https://github.com/ultralytics/ultralytics
@@ -429,7 +430,7 @@ def main(opt):
         main(opt)
     ```
     """
-    check_requirements(ROOT / "requirements.txt", exclude=("tensorboard", "thop"))
+    check_requirements(ROOT / "requirements.txt", exclude=("tensorboard", "ultralytics-thop"))
     run(**vars(opt))
 
 
