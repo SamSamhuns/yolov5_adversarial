@@ -10,19 +10,25 @@
     "tensorboard_port": 8994,
     "tensorboard_batch_log_interval": 15,
     "weights_file": "runs/weights/best.pt",
+    "model_backend": "yolov5",              # str: "yolov5" for this repo's DetectMultiBackend, "ultralytics" for v8/v11 weights.
+                                            # Only torch backends can be TRAINED against, exports sever the autograd graph. Defaults to yolov5
     "triplet_printfile": "triplets.csv",
     "device": "cuda:0",                     # (str): 'cpu' or 'cuda' or 'cuda:0,1,2,3'
     "seed": 42,                             # int: RNG seed for repeatability. Use null for a non deterministic run. Defaults to 42 when omitted
     "use_amp": true,
     "patch_name": "base",
     "val_epoch_freq": 100,
+    "val_target_size_frac": null,           # float: patch scale used for validation. null uses the midpoint of target_size_frac
     "patch_save_epoch_freq": 1,             # int freq for saving patches. 1 means save after every epoch
     "model_in_sz": [640, 640],              # (int, int): model input height, width
     "patch_src": "gray",                    # str: gray random, or path_to_init_patch
     "patch_img_mode": "RGB",                # str: patch channel image mode. Currently RGB * L supported
     "patch_size": [64, 64],                 # (int, int): must be (height, width)
-    "objective_class_id": null,             # int: class id to target for adv attack. Use null for general attack for all classes
+    "objective_class_id": null,             # int or [int, ...]: class id(s) to target. Use null for a general attack on all classes
     "min_pixel_area": null,                 # int: min pixel area to use for training. Pixel area chosen after resizing to model in size
+    "augment_image": true,                  # bool: photometric augmentation (blur, colour jitter, sharpness) plus label aware hflip
+    "augment_stage": "post",                # str: "post" augments the PATCHED image so the patch is degraded by the same camera
+                                            # response as the scene (physically correct). "pre" is the old behaviour. Defaults to post
     "target_size_frac": 0.3,                # float: patch proportion size compared to bbox size. Range also accepted i.e. [0.25, 0.4]
     "use_mul_add_gau": true,                # bool: use mul & add gaussian noise or not to patches
     "mul_gau_mean": 0.5,                    # float: mul gaussian noise mean (reduces contrast) mean. Range also accepted i.e. [0.25, 0.4]
@@ -31,6 +37,8 @@
     "x_off_loc": [-0.25, 0.25],             # [float, float]: left, right x-axis disp from bbox center
     "y_off_loc": [-0.25, 0.25],             # [float, float]: top, bottom y-axis disp from bbox center
     "rotate_patches": true,                 # bool: rotate patches or not
+    "perspective_scale": 0.1,               # float [0,1): out of plane tilt of the patch (keystone). 0 disables
+    "illumination_scale": 0.2,              # float [0,1): linear brightness ramp across the patch, directional light/shadow. 0 disables
     "transform_patches": true,              # bool: add bightness, contrast and noise transforms to patches or not
     "patch_pixel_range": [0, 255],          # [int, int]: patch pixel range, range is [0, 255], numbers div by 255 in patches
     "patch_alpha": 1,                       # float: patch opacity, recommended to set to 1
@@ -46,5 +54,9 @@
     "nps_mult": 0.01,                       # float: Use 0.01 when not using sal. With sal use 0.001
     "batch_size": 8,
     "debug_mode": false,                    # bool: if yes, images with adv drawn saved during each batch
-    "loss_target": "obj * cls"              # str: 'obj', 'cls', 'obj * cls'
+    "loss_target": "obj * cls",             # str: 'obj', 'cls', 'obj * cls'. A v8/v11 head has no objectness, use 'cls' or 'obj * cls' there
+    "loss_topk": 10,                        # int >=1: mean of the k highest scoring predictions. 1 is the original single max, which
+                                            # sends gradient to 1 of ~25k predictions per image at 640x640
+    "medianpool_kernel": 7                  # odd int: median filter over the patch each forward. Larger low passes the patch harder
+                                            # and routes gradient to fewer pixels. 0 or 1 disables it
 ```

@@ -54,7 +54,19 @@ REQUIRED_KEYS = {
     "x_off_loc",
     "y_off_loc",
 }
-OPTIONAL_KEYS = {"seed", "run_tensorboard"}
+OPTIONAL_KEYS = {
+    "seed",
+    "run_tensorboard",
+    "loss_topk",  # mean of the k best scoring predictions, 1 is the original single max
+    "medianpool_kernel",  # median filter size over the patch, 0/1 disables
+    "perspective_scale",  # out of plane tilt strength, 0 disables
+    "illumination_scale",  # brightness ramp strength across the patch, 0 disables
+    "augment_stage",  # "post" augments the patched image, "pre" the image before compositing
+    "model_backend",  # "yolov5" or "ultralytics" for v8/v11 weights
+    "val_target_size_frac",  # patch scale used during validation, null uses the training midpoint
+}
+AUGMENT_STAGES = {"pre", "post"}
+MODEL_BACKENDS = {"yolov5", "ultralytics"}
 LOSS_TARGETS = {"obj", "cls", "obj * cls", "obj*cls"}
 PATCH_IMG_MODES = {"L", "RGB"}
 
@@ -97,12 +109,34 @@ def validate_config(cfg: edict) -> edict:
         errors.append(f"loss_target must be one of {sorted(LOSS_TARGETS)}, got {cfg.loss_target}")
     if cfg.use_even_odd_images not in {"all", "even", "odd"}:
         errors.append(f"use_even_odd_images must be all, even or odd, got {cfg.use_even_odd_images}")
-    if cfg.objective_class_id is not None and not 0 <= cfg.objective_class_id < cfg.n_classes:
-        errors.append(f"objective_class_id must be null or in [0, {cfg.n_classes}), got {cfg.objective_class_id}")
+    obj_ids = cfg.objective_class_id
+    if obj_ids is not None:
+        obj_ids = [obj_ids] if isinstance(obj_ids, int) else obj_ids
+        if not (isinstance(obj_ids, (list, tuple)) and obj_ids and all(isinstance(c, int) for c in obj_ids)):
+            errors.append(f"objective_class_id must be null, an int, or a non empty list of ints, got {obj_ids}")
+        elif not all(0 <= c < cfg.n_classes for c in obj_ids):
+            errors.append(f"objective_class_id entries must be in [0, {cfg.n_classes}), got {obj_ids}")
     if not 0 < cfg.patch_alpha <= 1:
         errors.append(f"patch_alpha must be in (0, 1], got {cfg.patch_alpha}")
     if cfg.patch_src not in {"gray", "random"} and not osp.isfile(cfg.patch_src):
         errors.append(f'patch_src must be "gray", "random" or a path to an existing image, got {cfg.patch_src}')
+
+    if cfg.get("augment_stage", "post") not in AUGMENT_STAGES:
+        errors.append(f"augment_stage must be one of {sorted(AUGMENT_STAGES)}, got {cfg.augment_stage}")
+    if cfg.get("model_backend", "yolov5") not in MODEL_BACKENDS:
+        errors.append(f"model_backend must be one of {sorted(MODEL_BACKENDS)}, got {cfg.model_backend}")
+    if not (isinstance(cfg.get("loss_topk", 1), int) and cfg.get("loss_topk", 1) >= 1):
+        errors.append(f"loss_topk must be an int >= 1, got {cfg.loss_topk}")
+    kernel = cfg.get("medianpool_kernel", 7)
+    if not (isinstance(kernel, int) and (kernel <= 1 or kernel % 2 == 1)):
+        errors.append(f"medianpool_kernel must be an odd int, or 0/1 to disable, got {kernel}")
+    for key in ("perspective_scale", "illumination_scale"):
+        val = cfg.get(key, 0.0)
+        if not (isinstance(val, (int, float)) and 0 <= val < 1):
+            errors.append(f"{key} must be a number in [0, 1), got {val}")
+    val_frac = cfg.get("val_target_size_frac")
+    if val_frac is not None and not (isinstance(val_frac, (int, float)) and val_frac > 0):
+        errors.append(f"val_target_size_frac must be null or a positive number, got {val_frac}")
 
     _check_pair(cfg, "model_in_sz", errors, positive=True)
     _check_pair(cfg, "patch_size", errors, positive=True)

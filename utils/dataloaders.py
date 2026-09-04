@@ -23,9 +23,9 @@ from torch.utils.data import DataLoader, Dataset, dataloader, distributed
 from ultralytics.data.build import seed_worker
 from ultralytics.data.utils import get_hash, img2label_paths
 
+from adv_patch_gen.utils.bbox_patch_aug import BboxPatcher
 from utils.augmentations import (
     Albumentations,
-    BboxPatcher,
     augment_hsv,
     classify_albumentations,
     classify_transforms,

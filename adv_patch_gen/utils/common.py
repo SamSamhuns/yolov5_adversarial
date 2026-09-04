@@ -60,4 +60,3 @@ def pad_to_square(img: Image, pad_rgb: Tuple[int, int, int] = (127, 127, 127)) -
             padded_img = Image.new("RGB", (w, w), color=pad_rgb)
             padded_img.paste(img, (0, int(padding)))
     return padded_img
-

@@ -14,6 +14,7 @@ pytest.importorskip("torchvision")
 pytest.importorskip("easydict")
 pytest.importorskip("PIL")
 
+import numpy as np  # noqa: E402
 from easydict import EasyDict  # noqa: E402
 from PIL import Image as PILImage  # noqa: E402
 
@@ -45,7 +46,13 @@ def make_transformer(**kwargs):
 
 def transform(patch, lab, **fwd):
     """Apply the transformer with every stochastic knob off unless overridden."""
-    opts = {"use_mul_add_gau": False, "do_transforms": False, "do_rotate": False, "rand_loc": False}
+    opts = {
+        "use_mul_add_gau": False,
+        "do_transforms": False,
+        "do_rotate": False,
+        "rand_loc": False,
+        "do_perspective": False,
+    }
     opts.update({k: v for k, v in fwd.items() if k in opts})
     tf = make_transformer(**{k: v for k, v in fwd.items() if k not in opts})
     return tf(patch, lab, MODEL_IN_SZ, **opts)
@@ -221,6 +228,95 @@ class TestLosses:
         assert torch.allclose(MaxProbExtractor(cfg)(out), torch.tensor([0.7, 0.4]), atol=1e-6)
 
 
+    def test_topk_of_one_is_the_original_max(self):
+        cfg = SimpleNamespace(n_classes=2, objective_class_id=None, loss_target=lambda o, c: o * c, loss_topk=1)
+        out = torch.zeros(1, 8, 7)
+        out[..., 4] = 1.0
+        out[0, :, 5] = torch.tensor([0.1, 0.9, 0.3, 0.8, 0.05, 0.7, 0.2, 0.4])
+        assert torch.allclose(MaxProbExtractor(cfg)(out), torch.tensor([0.9]), atol=1e-6)
+
+    def test_topk_averages_the_k_best_predictions(self):
+        """Regression: a single max sends gradient to 1 of ~25k predictions per image."""
+        scores = [0.1, 0.9, 0.3, 0.8, 0.05, 0.7, 0.2, 0.4]
+        out = torch.zeros(1, 8, 7)
+        out[..., 4] = 1.0
+        out[0, :, 5] = torch.tensor(scores)
+        for k in (2, 3, 8):
+            cfg = SimpleNamespace(n_classes=2, objective_class_id=None, loss_target=lambda o, c: o * c, loss_topk=k)
+            expected = sum(sorted(scores, reverse=True)[:k]) / k
+            assert torch.allclose(MaxProbExtractor(cfg)(out), torch.tensor([expected]), atol=1e-6), f"k={k}"
+
+    def test_topk_larger_than_prediction_count_is_clamped(self):
+        cfg = SimpleNamespace(n_classes=2, objective_class_id=None, loss_target=lambda o, c: o * c, loss_topk=999)
+        out = torch.zeros(1, 3, 7)
+        out[..., 4] = 1.0
+        out[0, :, 5] = torch.tensor([0.3, 0.6, 0.9])
+        assert torch.allclose(MaxProbExtractor(cfg)(out), torch.tensor([0.6]), atol=1e-6)
+
+    def test_multiple_target_classes_take_the_best_of_them(self):
+        cfg = SimpleNamespace(n_classes=4, objective_class_id=[1, 3], loss_target=lambda o, c: o * c, loss_topk=1)
+        out = torch.zeros(1, 4, 9)
+        out[..., 4] = 1.0
+        out[0, 0, 5 + 0] = 0.95  # untargeted class, must be ignored
+        out[0, 1, 5 + 1] = 0.60  # targeted
+        out[0, 2, 5 + 3] = 0.75  # targeted, the best of the targeted ones
+        assert torch.allclose(MaxProbExtractor(cfg)(out), torch.tensor([0.75]), atol=1e-6)
+
+    def test_yolov8_style_head_is_detected(self):
+        """v8/v11 emit [batch, 4 + n_classes, n_preds] with no objectness channel."""
+        n_cls = 4
+        cfg = SimpleNamespace(n_classes=n_cls, objective_class_id=2, loss_target=lambda o, c: o * c, loss_topk=1)
+        out = torch.zeros(1, 4 + n_cls, 6)  # transposed layout
+        out[0, 4 + 2, 3] = 0.83
+        assert torch.allclose(MaxProbExtractor(cfg)(out), torch.tensor([0.83]), atol=1e-6)
+
+    def test_unrecognized_head_shape_raises(self):
+        cfg = SimpleNamespace(n_classes=4, objective_class_id=None, loss_target=lambda o, c: o * c, loss_topk=1)
+        with pytest.raises(ValueError, match="Unrecognized detector output"):
+            MaxProbExtractor(cfg)(torch.zeros(1, 11, 17))
+
+
+class TestEOT:
+    """The expectation-over-transformation knobs added for physical realism."""
+
+    def test_perspective_off_reproduces_no_perspective(self):
+        torch.manual_seed(0)
+        base = transform(torch.full((3, 64, 64), 0.5), labels((0, 0.5, 0.5, 0.3, 0.3)), perspective_scale=0.0)
+        torch.manual_seed(0)
+        same = transform(
+            torch.full((3, 64, 64), 0.5), labels((0, 0.5, 0.5, 0.3, 0.3)), perspective_scale=0.0, do_perspective=True
+        )
+        assert torch.allclose(base, same), "perspective_scale=0 must be a no-op"
+
+    def test_perspective_warps_the_patch(self):
+        patch = torch.full((3, 64, 64), 0.5)
+        lab = labels((0, 0.5, 0.5, 0.3, 0.3))
+        flat = transform(patch, lab, perspective_scale=0.0)
+        tilted = transform(patch, lab, perspective_scale=0.4, do_perspective=True)
+        assert torch.isfinite(tilted).all(), "the plane clamp must keep the grid finite"
+        assert not torch.allclose(flat, tilted), "a non-zero perspective_scale should change the render"
+        assert tilted.min() >= 0.0 and tilted.max() <= 1.0
+
+    def test_illumination_ramp_makes_the_patch_non_uniform(self):
+        patch = torch.full((3, 64, 64), 0.5)
+        lab = labels((0, 0.5, 0.5, 0.3, 0.3))
+        flat = transform(patch, lab, illumination_scale=0.0)
+        lit = transform(patch, lab, illumination_scale=0.5)
+        x0, y0, x1, y1 = nonzero_bbox(lit[0, 0])
+        inner = lit[0, 0, :, y0 + 3 : y1 - 2, x0 + 3 : x1 - 2]
+        assert inner.std() > flat[0, 0, :, y0 + 3 : y1 - 2, x0 + 3 : x1 - 2].std()
+        assert lit.min() >= 0.0 and lit.max() <= 1.0
+
+    def test_median_pool_can_be_disabled(self):
+        patch = torch.rand(3, 64, 64)
+        lab = labels((0, 0.5, 0.5, 0.4, 0.4))
+        pooled = transform(patch, lab, medianpool_kernel=7)
+        raw = transform(patch, lab, medianpool_kernel=0)
+        x0, y0, x1, y1 = nonzero_bbox(raw[0, 0])
+        box = (slice(None), slice(y0 + 3, y1 - 2), slice(x0 + 3, x1 - 2))
+        assert raw[0, 0][box].std() > pooled[0, 0][box].std(), "the median filter should smooth the patch"
+
+
 class TestConfigValidation:
     """The shipped config must validate, and common mistakes must be caught."""
 
@@ -257,6 +353,104 @@ class TestConfigValidation:
         del cfg["start_lr"]
         with pytest.raises(ValueError, match="missing key"):
             validate_config(EasyDict(cfg))
+
+
+class TestClassIdHandling:
+    """objective_class_id accepts null, an int or a list, and all three must reach every consumer."""
+
+    @staticmethod
+    def tester():
+        pytest.importorskip("pycocotools")
+        from test_patch import PatchTester
+
+        return PatchTester
+
+    def test_normalizes_none_int_and_list(self):
+        pt = self.tester()
+        assert pt.as_class_id_list(None) is None
+        assert pt.as_class_id_list(2) == [2]
+        assert pt.as_class_id_list([0, 3]) == [0, 3]
+        assert pt.as_class_id_list((1, 2)) == [1, 2]
+
+    def test_class_mask_selects_every_listed_id(self):
+        pt = self.tester()
+        classes = torch.tensor([0.0, 1.0, 2.0, 3.0, 1.0])
+        assert pt.class_mask(classes, [1]).tolist() == [False, True, False, False, True]
+        assert pt.class_mask(classes, [1, 3]).tolist() == [False, True, False, True, True]
+
+    def test_calc_asr_accepts_a_list_of_target_classes(self):
+        pt = self.tester()
+        # two gt boxes of class 1 and 2, neither re-detected under the patch
+        gt = torch.tensor([[1.0, 10, 10, 60, 60], [2.0, 200, 200, 260, 260]])
+        preds = torch.zeros((0, 6))
+        for cls_id in (1, [1, 2], None):
+            asr = pt.calc_asr(gt, preds, ["a", "b", "c", "d"], cls_id=cls_id)
+            assert all(0.0 <= v <= 1.0 for v in asr), f"cls_id={cls_id} gave {asr}"
+            assert asr[3] == pytest.approx(1.0, abs=1e-3), f"all boxes hidden should be asr 1.0, cls_id={cls_id}"
+
+
+class TestBboxPatcher:
+    """The detector-side patch augmentation, whose definition a merge with ultralytics dropped."""
+
+    def test_dataloaders_import_chain_is_intact(self):
+        """utils.dataloaders is imported by models.common, so a missing BboxPatcher breaks
+        train.py, val.py, detect.py and export.py, not just the adv patch code."""
+        import utils.dataloaders  # noqa: F401, PLC0415
+
+        from utils.dataloaders import BboxPatcher  # noqa: PLC0415
+
+        assert BboxPatcher is not None
+
+    def test_no_patches_is_a_passthrough(self, tmp_path):
+        from adv_patch_gen.utils.bbox_patch_aug import BboxPatcher  # noqa: PLC0415
+
+        patcher = BboxPatcher(patch_dir=str(tmp_path))
+        assert patcher.patches == []
+        img = np.full((64, 64, 3), 128, dtype=np.uint8)
+        boxes = np.array([[0, 8, 8, 40, 40]])
+        assert np.array_equal(patcher(img, boxes), img)
+
+    def test_empty_patch_dir_string_does_not_glob_the_cwd(self):
+        from adv_patch_gen.utils.bbox_patch_aug import BboxPatcher  # noqa: PLC0415
+
+        assert BboxPatcher(patch_dir="").patches == []
+
+    def test_patch_is_pasted_onto_the_box(self, tmp_path):
+        from adv_patch_gen.utils.bbox_patch_aug import BboxPatcher  # noqa: PLC0415
+
+        patch_dir = tmp_path / "patches"
+        patch_dir.mkdir()
+        PILImage.new("RGB", (32, 32), color=(255, 0, 0)).save(patch_dir / "p.png")
+
+        patcher = BboxPatcher(patch_dir=str(patch_dir), patch_apply_prob=1.0, scale_range=(0.3, 0.3))
+        assert len(patcher.patches) == 1
+        img = np.full((128, 128, 3), 128, dtype=np.uint8)
+        out = patcher(img, np.array([[0, 32, 32, 96, 96]]))
+        assert out.shape == img.shape and out.dtype == img.dtype
+        assert not np.array_equal(out, img), "a patch should have been pasted"
+        # only the region around the box changes
+        assert np.array_equal(out[:24, :24], img[:24, :24]), "corners far from the box must be untouched"
+
+    def test_zero_apply_probability_leaves_the_image_alone(self, tmp_path):
+        from adv_patch_gen.utils.bbox_patch_aug import BboxPatcher  # noqa: PLC0415
+
+        patch_dir = tmp_path / "patches"
+        patch_dir.mkdir()
+        PILImage.new("RGB", (32, 32), color=(255, 0, 0)).save(patch_dir / "p.png")
+        patcher = BboxPatcher(patch_dir=str(patch_dir), patch_apply_prob=0.0)
+        img = np.full((128, 128, 3), 128, dtype=np.uint8)
+        assert np.array_equal(patcher(img, np.array([[0, 32, 32, 96, 96]])), img)
+
+    def test_degenerate_boxes_are_skipped(self, tmp_path):
+        from adv_patch_gen.utils.bbox_patch_aug import BboxPatcher  # noqa: PLC0415
+
+        patch_dir = tmp_path / "patches"
+        patch_dir.mkdir()
+        PILImage.new("RGB", (32, 32), color=(255, 0, 0)).save(patch_dir / "p.png")
+        patcher = BboxPatcher(patch_dir=str(patch_dir), patch_apply_prob=1.0)
+        img = np.full((128, 128, 3), 128, dtype=np.uint8)
+        boxes = np.array([[0, 50, 50, 50, 50], [0, 60, 60, 40, 40]])  # zero and negative extent
+        assert np.array_equal(patcher(img, boxes), img)
 
 
 class TestDataset:

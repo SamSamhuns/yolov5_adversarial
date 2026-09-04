@@ -103,9 +103,9 @@ def conv_visdrone_2_yolo(
     src_image_path = osp.join(source_image_dir, "*")
     src_annot_paths = sorted(glob.glob(src_annot_path))
     src_image_paths = [p for p in sorted(glob.glob(src_image_path)) if osp.splitext(p)[-1] in IMG_EXT]
-    assert len(src_image_paths) == len(
-        src_annot_paths
-    ), f"Num src images: {len(src_image_paths)} & num src annots: {len(src_annot_paths)} do not match"
+    assert len(src_image_paths) == len(src_annot_paths), (
+        f"Num src images: {len(src_image_paths)} & num src annots: {len(src_annot_paths)} do not match"
+    )
 
     os.makedirs(target_annot_dir, exist_ok=True)
     low_dim_cutoff = float("-inf") if not low_dim_cutoff else low_dim_cutoff
@@ -140,7 +140,7 @@ def conv_visdrone_2_yolo(
                         # only use objects used for eval along and all levels of occlusion (0,1,2)
                         if score and occu <= 2:
                             class_id = CLASS_ID_REMAP[class_id] if CLASS_ID_REMAP else class_id
-                            fw.write(f"{class_id} {xc/iw} {yc/ih} {w/iw} {h/ih}\n")
+                            fw.write(f"{class_id} {xc / iw} {yc / ih} {w / iw} {h / ih}\n")
                             new_box_count += 1
                 target_image_path = osp.join(
                     osp.dirname(osp.dirname(target_annot_file)),

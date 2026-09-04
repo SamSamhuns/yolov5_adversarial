@@ -30,15 +30,18 @@ class PatchTransformer(nn.Module):
         x_off_loc: Tuple[float, float] = [-0.25, 0.25],
         y_off_loc: Tuple[float, float] = [-0.25, 0.25],
         dev: torch.device = torch.device("cuda:0"),
+        medianpool_kernel: int = 7,
+        perspective_scale: float = 0.0,
+        illumination_scale: float = 0.0,
     ):
         super(PatchTransformer, self).__init__()
         # convert to duplicated lists/tuples to unpack and send to np.random.uniform
         self.t_size_frac = [t_size_frac, t_size_frac] if isinstance(t_size_frac, float) else t_size_frac
         self.m_gau_mean = [mul_gau_mean, mul_gau_mean] if isinstance(mul_gau_mean, float) else mul_gau_mean
         self.m_gau_std = [mul_gau_std, mul_gau_std] if isinstance(mul_gau_std, float) else mul_gau_std
-        assert (
-            len(self.t_size_frac) == 2 and len(self.m_gau_mean) == 2 and len(self.m_gau_std) == 2
-        ), "Range must have 2 values"
+        assert len(self.t_size_frac) == 2 and len(self.m_gau_mean) == 2 and len(self.m_gau_std) == 2, (
+            "Range must have 2 values"
+        )
         self.x_off_loc = x_off_loc
         self.y_off_loc = y_off_loc
         self.dev = dev
@@ -49,12 +52,26 @@ class PatchTransformer(nn.Module):
         self.noise_factor = 0.10
         self.minangle = -20 / 180 * math.pi
         self.maxangle = 20 / 180 * math.pi
-        self.medianpooler = MedianPool2d(kernel_size=7, same=True)
+        # a median filter over the patch each forward. Larger kernels low pass the patch harder and
+        # route gradient to fewer pixels, 0 or 1 disables it entirely.
+        self.medianpooler = MedianPool2d(kernel_size=medianpool_kernel, same=True) if medianpool_kernel > 1 else None
+        # out of plane tilt, so the patch is not always seen fronto-parallel
+        self.perspective_scale = perspective_scale
+        # linear brightness ramp across the patch, standing in for directional light and soft shadow
+        self.illumination_scale = illumination_scale
 
         self.tensor = torch.FloatTensor if "cpu" in str(dev) else torch.cuda.FloatTensor
 
     def forward(
-        self, adv_patch, lab_batch, model_in_sz, use_mul_add_gau=True, do_transforms=True, do_rotate=True, rand_loc=True
+        self,
+        adv_patch,
+        lab_batch,
+        model_in_sz,
+        use_mul_add_gau=True,
+        do_transforms=True,
+        do_rotate=True,
+        rand_loc=True,
+        do_perspective=True,
     ):
         # add gaussian noise to reduce contrast with a stohastic process
         p_c, p_h, p_w = adv_patch.shape
@@ -67,7 +84,9 @@ class PatchTransformer(nn.Module):
             )
             add_gau = torch.normal(0, 0.001, (p_c, p_h, p_w), device=self.dev)
             adv_patch = adv_patch * mul_gau + add_gau
-        adv_patch = self.medianpooler(adv_patch.unsqueeze(0))
+        adv_patch = adv_patch.unsqueeze(0)
+        if self.medianpooler is not None:
+            adv_patch = self.medianpooler(adv_patch)
         m_h, m_w = model_in_sz
         # Make a batch of patches
         adv_patch = adv_patch.unsqueeze(0)
@@ -95,6 +114,17 @@ class PatchTransformer(nn.Module):
             adv_batch = adv_batch * contrast + brightness + noise
 
             adv_batch = torch.clamp(adv_batch, 0.000001, 0.99999)
+
+        # Linear illumination ramp across the patch, one random direction per patch, standing in for
+        # directional lighting and soft shadow. Applied at patch resolution, before the warp.
+        if self.illumination_scale > 0:
+            p_h_cur, p_w_cur = adv_batch.size(-2), adv_batch.size(-1)
+            ramp_y = torch.linspace(-1, 1, p_h_cur, device=adv_batch.device).view(1, 1, 1, p_h_cur, 1)
+            ramp_x = torch.linspace(-1, 1, p_w_cur, device=adv_batch.device).view(1, 1, 1, 1, p_w_cur)
+            dir_y = self.tensor(batch_size).uniform_(-1, 1)[:, :, None, None, None]
+            dir_x = self.tensor(batch_size).uniform_(-1, 1)[:, :, None, None, None]
+            illum = 1.0 + self.illumination_scale * (dir_x * ramp_x + dir_y * ramp_y)
+            adv_batch = torch.clamp(adv_batch * illum, 0.000001, 0.99999)
 
         # lab_batch is zero-padded up to max_labels, so drop patches for the zero area filler rows.
         # The mask also marks where a patch landed, which PatchApplier needs since the clamp below
@@ -156,7 +186,20 @@ class PatchTransformer(nn.Module):
         theta[:, 1, 2] = (-tx * sin + ty * cos) / scale_y
 
         out_shape = (s[0] * s[1], s[2], m_h, m_w)
-        grid = F.affine_grid(theta, out_shape, align_corners=False)
+        # The sampling grid comes only from label boxes and random draws, none of which carry
+        # gradient, so it can be built under no_grad and perspective divided in place.
+        with torch.no_grad():
+            grid = F.affine_grid(theta, out_shape, align_corners=False)
+            if do_perspective and self.perspective_scale > 0:
+                # Divide the grid by a plane w = 1 + px*x + py*y. That is the inverse map of a patch
+                # lying on a surface tilted out of the image plane, i.e. the usual keystone effect.
+                px = self.tensor(anglesize).uniform_(-self.perspective_scale, self.perspective_scale)
+                py = self.tensor(anglesize).uniform_(-self.perspective_scale, self.perspective_scale)
+                xs = torch.linspace(-1, 1, m_w, device=grid.device).view(1, 1, m_w)
+                ys = torch.linspace(-1, 1, m_h, device=grid.device).view(1, m_h, 1)
+                w_plane = 1.0 + px[:, None, None] * xs + py[:, None, None] * ys
+                # clamp keeps the plane from crossing zero, which would mirror or blow up the patch
+                grid.div_(w_plane.clamp(min=0.2).unsqueeze(-1))
         adv_batch_t = F.grid_sample(adv_batch, grid, align_corners=False)
         msk_batch_t = F.grid_sample(msk_batch, grid, align_corners=False)
 

@@ -13,7 +13,6 @@ from pathlib import Path
 
 import numpy as np
 import torch
-import torch.nn.functional as F
 from easydict import EasyDict as edict
 from PIL import Image
 from torch import autograd, optim
@@ -25,8 +24,8 @@ from adv_patch_gen.utils.common import IMG_EXTNS, is_port_in_use, pad_to_square,
 from adv_patch_gen.utils.config_parser import get_argparser, load_config_object
 from adv_patch_gen.utils.dataset import YOLODataset
 from adv_patch_gen.utils.loss import MaxProbExtractor, NPSLoss, SaliencyLoss, TotalVariationLoss
+from adv_patch_gen.utils.model import load_detector, supports_patch_training, unwrap_preds
 from adv_patch_gen.utils.patch import PatchApplier, PatchTransformer
-from models.common import DetectMultiBackend
 from test_patch import PatchTester
 from utils.general import non_max_suppression, xyxy2xywh
 from utils.torch_utils import GradScaler, select_device, smart_amp_autocast
@@ -42,11 +41,24 @@ class PatchTrainer:
         self.cfg = cfg
         self.dev = select_device(cfg.device)
 
-        model = DetectMultiBackend(cfg.weights_file, device=self.dev, dnn=False, data=None, fp16=False)
-        self.model = model.eval()
+        self.model = load_detector(cfg.weights_file, self.dev, cfg.get("model_backend"))
+        if not supports_patch_training(self.model):
+            raise ValueError(
+                f"{cfg.weights_file} loads as an exported backend. Those return predictions through "
+                "numpy, which severs the autograd graph, so no gradient can reach the patch. Train "
+                "against .pt/.torchscript weights, then use test_patch.py to evaluate on the export."
+            )
 
         self.patch_transformer = PatchTransformer(
-            cfg.target_size_frac, cfg.mul_gau_mean, cfg.mul_gau_std, cfg.x_off_loc, cfg.y_off_loc, self.dev
+            cfg.target_size_frac,
+            cfg.mul_gau_mean,
+            cfg.mul_gau_std,
+            cfg.x_off_loc,
+            cfg.y_off_loc,
+            self.dev,
+            medianpool_kernel=cfg.get("medianpool_kernel", 7),
+            perspective_scale=cfg.get("perspective_scale", 0.0),
+            illumination_scale=cfg.get("illumination_scale", 0.0),
         ).to(self.dev)
         self.patch_applier = PatchApplier(cfg.patch_alpha).to(self.dev)
         self.prob_extractor = MaxProbExtractor(cfg).to(self.dev)
@@ -65,16 +77,19 @@ class PatchTrainer:
         for cfg_key, cfg_val in cfg.items():
             self.writer.add_text(cfg_key, str(cfg_val))
 
-        # setting train image augmentations
-        transforms = None
-        if cfg.augment_image:
-            transforms = T.Compose(
-                [
-                    T.GaussianBlur(kernel_size=(3, 3), sigma=(0.1, 1)),
-                    T.ColorJitter(brightness=0.2, hue=0.04, contrast=0.1),
-                    T.RandomAdjustSharpness(sharpness_factor=2),
-                ]
-            )
+        # Photometric augmentation. "post" applies it to the patched image so the patch is degraded
+        # by the same blur and colour response as the scene, which is what a camera actually does.
+        # "pre" is the original behaviour, augmenting the image before the patch is composited.
+        self.augment_stage = cfg.get("augment_stage", "post") if cfg.augment_image else None
+        photometric = T.Compose(
+            [
+                T.GaussianBlur(kernel_size=(3, 3), sigma=(0.1, 1)),
+                T.ColorJitter(brightness=0.2, hue=0.04, contrast=0.1),
+                T.RandomAdjustSharpness(sharpness_factor=2),
+            ]
+        )
+        self.post_augment = photometric if self.augment_stage == "post" else None
+        transforms = photometric if self.augment_stage == "pre" else None
 
         # load training dataset
         self.train_loader = torch.utils.data.DataLoader(
@@ -85,6 +100,7 @@ class PatchTrainer:
                 model_in_sz=cfg.model_in_sz,
                 use_even_odd_images=cfg.use_even_odd_images,
                 transform=transforms,
+                hflip_prob=0.5 if cfg.augment_image else 0.0,
                 filter_class_ids=cfg.objective_class_id,
                 min_pixel_area=cfg.min_pixel_area,
             ),
@@ -201,9 +217,11 @@ class PatchTrainer:
                         do_transforms=self.cfg.transform_patches,
                         do_rotate=self.cfg.rotate_patches,
                         rand_loc=self.cfg.random_patch_loc,
+                        do_perspective=True,
                     )
                     p_img_batch = self.patch_applier(img_batch, adv_batch_t)
-                    p_img_batch = F.interpolate(p_img_batch, (self.cfg.model_in_sz[0], self.cfg.model_in_sz[1]))
+                    if self.post_augment is not None:
+                        p_img_batch = self.post_augment(p_img_batch)
 
                     if self.cfg.debug_mode:
                         img = p_img_batch[
@@ -215,7 +233,7 @@ class PatchTrainer:
                         img.save(osp.join(self.cfg.log_dir, "train_patch_applied_imgs", f"b_{i_batch}.jpg"))
 
                     with smart_amp_autocast(use_amp):
-                        output = self.model(p_img_batch)[0]
+                        output = unwrap_preds(self.model(p_img_batch))
                         max_prob = self.prob_extractor(output)
                         sal = self.sal_loss(adv_patch) if self.cfg.sal_mult != 0 else zero_tensor
                         nps = self.nps_loss(adv_patch) if self.cfg.nps_mult != 0 else zero_tensor
@@ -285,13 +303,16 @@ class PatchTrainer:
         img_paths = sorted([p for p in img_paths if osp.splitext(p)[-1] in IMG_EXTNS])
 
         train_t_size_frac = self.patch_transformer.t_size_frac
-        self.patch_transformer.t_size_frac = [0.3, 0.3]  # use a frac of 0.3 for validation
+        # score at one fixed scale so epochs are comparable, defaulting to the middle of the
+        # training range rather than a hardcoded 0.3 that may sit outside it
+        val_frac = self.cfg.get("val_target_size_frac") or sum(train_t_size_frac) / 2
+        self.patch_transformer.t_size_frac = [val_frac, val_frac]
         # to calc confusion matrixes and attack success rates later
         all_labels = []
         all_patch_preds = []
 
         m_h, m_w = self.cfg.model_in_sz
-        cls_id = self.cfg.objective_class_id
+        cls_ids = PatchTester.as_class_id_list(self.cfg.objective_class_id)
         zeros_tensor = torch.zeros([1, 5]).to(self.dev)
         #### iterate through all images ####
         for imgfile in tqdm(img_paths, desc=f"Running val epoch {epoch}"):
@@ -303,11 +324,11 @@ class PatchTrainer:
             #######################################
             # generate labels to use later for patched image
             padded_img_tensor = T.ToTensor()(padded_img).unsqueeze(0).to(self.dev)
-            pred = self.model(padded_img_tensor)
+            pred = unwrap_preds(self.model(padded_img_tensor))
             boxes = non_max_suppression(pred, conf_thresh, nms_thresh)[0]
             # if doing targeted class performance check, ignore non target classes
-            if cls_id is not None:
-                boxes = boxes[boxes[:, -1] == cls_id]
+            if cls_ids is not None:
+                boxes = boxes[PatchTester.class_mask(boxes[:, -1], cls_ids)]
             all_labels.append(boxes.clone())
             boxes = xyxy2xywh(boxes)
 
@@ -350,11 +371,11 @@ class PatchTrainer:
                 )
                 p_tensor_batch = self.patch_applier(img_fake_batch, adv_batch_t)
 
-            pred = self.model(p_tensor_batch)
+            pred = unwrap_preds(self.model(p_tensor_batch))
             boxes = non_max_suppression(pred, conf_thresh, nms_thresh)[0]
             # if doing targeted class performance check, ignore non target classes
-            if cls_id is not None:
-                boxes = boxes[boxes[:, -1] == cls_id]
+            if cls_ids is not None:
+                boxes = boxes[PatchTester.class_mask(boxes[:, -1], cls_ids)]
             all_patch_preds.append(boxes.clone())
 
             # save properly patched img if debug mode
@@ -370,7 +391,7 @@ class PatchTrainer:
         # patch and noise labels are of shapes (Array[N, 6]), x1, y1, x2, y2, conf, class
         all_patch_preds = torch.cat(all_patch_preds)
         asr_s, asr_m, asr_l, asr_a = PatchTester.calc_asr(
-            all_labels, all_patch_preds, class_list=self.cfg.class_list, cls_id=cls_id, conf_thresh=conf_thresh
+            all_labels, all_patch_preds, class_list=self.cfg.class_list, cls_id=cls_ids, conf_thresh=conf_thresh
         )
 
         print("Validation metrics for images with patches:")

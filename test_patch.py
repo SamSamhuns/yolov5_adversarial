@@ -21,13 +21,13 @@ from torchvision import transforms
 
 from adv_patch_gen.utils.common import IMG_EXTNS, BColors, pad_to_square, set_seed
 from adv_patch_gen.utils.config_parser import get_argparser, load_config_object
+from adv_patch_gen.utils.model import load_detector, unwrap_preds
 from adv_patch_gen.utils.patch import PatchApplier, PatchTransformer
 from adv_patch_gen.utils.video import (
     ffmpeg_combine_three_vids,
     ffmpeg_combine_two_vids,
     ffmpeg_create_video_from_image_dir,
 )
-from models.common import DetectMultiBackend
 from utils.general import non_max_suppression, xyxy2xywh
 from utils.metrics import ConfusionMatrix
 from utils.plots import Annotator, colors
@@ -78,12 +78,34 @@ class PatchTester:
         self.cfg = cfg
         self.dev = select_device(cfg.device)
 
-        model = DetectMultiBackend(cfg.weights_file, device=self.dev, dnn=False, data=None, fp16=False)
-        self.model = model.eval().to(self.dev)
+        # any DetectMultiBackend export format works here, testing needs no gradient
+        self.model = load_detector(cfg.weights_file, self.dev, cfg.get("model_backend"))
         self.patch_transformer = PatchTransformer(
-            cfg.target_size_frac, cfg.mul_gau_mean, cfg.mul_gau_std, cfg.x_off_loc, cfg.y_off_loc, self.dev
+            cfg.target_size_frac,
+            cfg.mul_gau_mean,
+            cfg.mul_gau_std,
+            cfg.x_off_loc,
+            cfg.y_off_loc,
+            self.dev,
+            medianpool_kernel=cfg.get("medianpool_kernel", 7),
+            perspective_scale=cfg.get("perspective_scale", 0.0),
+            illumination_scale=cfg.get("illumination_scale", 0.0),
         ).to(self.dev)
         self.patch_applier = PatchApplier(cfg.patch_alpha).to(self.dev)
+
+    @staticmethod
+    def as_class_id_list(cls_id) -> Optional[List[int]]:
+        """Normalize an objective_class_id config value (None, int or list) to None or a list of ints."""
+        if cls_id is None:
+            return None
+        return [int(cls_id)] if isinstance(cls_id, (int, np.integer)) else [int(c) for c in cls_id]
+
+    @staticmethod
+    def class_mask(classes: torch.Tensor, cls_ids: List[int]) -> torch.Tensor:
+        """Boolean mask selecting rows whose class is any of cls_ids."""
+        if len(cls_ids) == 1:
+            return classes == cls_ids[0]
+        return torch.isin(classes, torch.tensor(cls_ids, device=classes.device, dtype=classes.dtype))
 
     @staticmethod
     def calc_asr(
@@ -109,7 +131,7 @@ class PatchTester:
             conf_thresh: confidence threshold used for the detections, forwarded to the confusion matrix
             lo_area: small bbox area threshold
             hi_area: large bbox area threshold
-            cls_id: filter for a particular class
+            cls_id: filter for a particular class, an int or a list of ints. None uses every class
             class_agnostic: All classes are considered the same
             recompute_asr_all: Recomputer ASR for all boxes aggregated together slower but more acc. asr
         Return:
@@ -117,9 +139,10 @@ class PatchTester:
                 float, float, float, float
         """
         # if cls_id is provided and evaluation is not class agnostic then mis-clsfs count as attack success
-        if cls_id is not None:
-            boxes = boxes[boxes[:, 0] == cls_id]
-            boxes_pred = boxes_pred[boxes_pred[:, 5] == cls_id]
+        cls_ids = PatchTester.as_class_id_list(cls_id)
+        if cls_ids is not None:
+            boxes = boxes[PatchTester.class_mask(boxes[:, 0], cls_ids)]
+            boxes_pred = boxes_pred[PatchTester.class_mask(boxes_pred[:, 5], cls_ids)]
 
         boxes_area = (boxes[:, 3] - boxes[:, 1]) * (boxes[:, 4] - boxes[:, 2])
         boxes_pred_area = (boxes_pred[:, 2] - boxes_pred[:, 0]) * (boxes_pred[:, 3] - boxes_pred[:, 1])
@@ -156,11 +179,11 @@ class PatchTester:
             tp_large = tps_large.sum() + fps_large.sum()
             tp_all = tps_all.sum() + fps_all.sum()
         # filtering by cls_id or non class_agnostic mode (Mis-clsfs are successes)
-        elif cls_id is not None:  # consider single class, mis-clsfs or non-dets
-            tp_small = tps_small[cls_id]
-            tp_med = tps_med[cls_id]
-            tp_large = tps_large[cls_id]
-            tp_all = tps_all[cls_id]
+        elif cls_ids is not None:  # consider the targeted classes only, mis-clsfs or non-dets
+            tp_small = tps_small[cls_ids].sum()
+            tp_med = tps_med[cls_ids].sum()
+            tp_large = tps_large[cls_ids].sum()
+            tp_all = tps_all[cls_ids].sum()
         else:  # non class_agnostic, mis-clsfs or non-dets
             tp_small = tps_small.sum()
             tp_med = tps_med.sum()
@@ -190,11 +213,12 @@ class PatchTester:
     def _detect(self, img_tensor, conf_thresh: float, nms_thresh: float, cls_id, min_pixel_area):
         """Run the detector on one image, returning kept boxes [N, 6] xyxy conf cls, dets found, dets dropped."""
         with torch.no_grad():
-            pred = self.model(img_tensor)
+            pred = unwrap_preds(self.model(img_tensor))
             boxes = non_max_suppression(pred, conf_thresh, nms_thresh)[0]
         # if doing targeted class performance check, ignore non target classes
-        if cls_id is not None:
-            boxes = boxes[boxes[:, -1] == cls_id]
+        cls_ids = PatchTester.as_class_id_list(cls_id)
+        if cls_ids is not None:
+            boxes = boxes[PatchTester.class_mask(boxes[:, -1], cls_ids)]
         n_det = boxes.shape[0]
         # filter det bounding boxes by pixel area
         if min_pixel_area is not None:
@@ -403,6 +427,7 @@ class PatchTester:
                         do_transforms=apply_patch_transforms,
                         do_rotate=apply_patch_transforms,
                         rand_loc=apply_patch_transforms,
+                        do_perspective=apply_patch_transforms,
                     )
                     p_tensor_batch = self.patch_applier(padded_img_tensor, adv_batch_t)
 
@@ -637,10 +662,11 @@ def main():
     parser.add_argument(
         "--target-class",
         type=int,
+        nargs="+",
         dest="target_class",
         default=None,
         required=False,
-        help="Target specific class with id for misclassification test (default: %(default)s)",
+        help="Target one or more class ids for the misclassification test (default: %(default)s)",
     )
     parser.add_argument(
         "--min-pixel-area",
@@ -675,7 +701,7 @@ def main():
         )
         args.target_class = None
     else:
-        savename += f"_tc{args.target_class}" if args.target_class is not None else ""
+        savename += ("_tc" + "-".join(str(c) for c in args.target_class)) if args.target_class else ""
     savename += "_agnostic" if args.class_agnostic else ""
     savename += f"_gt{args.min_pixel_area}" if args.min_pixel_area is not None else ""
     cfg.savedir = osp.join(args.savedir, savename)

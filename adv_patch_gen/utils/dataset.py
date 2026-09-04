@@ -26,6 +26,9 @@ class YOLODataset(Dataset):
         max_labels: max number labels to use for each image
         model_in_sz: model input image size (height, width)
         use_even_odd_images: optionally load a data subset based on the last numeric char of the img filename [all, even, odd]
+        transform: photometric augmentation applied to the image. Note that applying it here means the
+            patch, which is composited later, never sees it. Prefer augmenting after compositing.
+        hflip_prob: probability of a label aware horizontal flip
         filter_class_id: np.ndarray class id(s) to get. Set None to get all classes
         min_pixel_area: min pixel area below which all boxes are filtered out. (Out of the model in size area)
     """
@@ -38,6 +41,7 @@ class YOLODataset(Dataset):
         model_in_sz: Tuple[int, int],
         use_even_odd_images: str = "all",
         transform: Optional[torch.nn.Module] = None,
+        hflip_prob: float = 0.0,
         filter_class_ids: Optional[np.array] = None,
         min_pixel_area: Optional[int] = None,
     ):
@@ -63,6 +67,7 @@ class YOLODataset(Dataset):
         self.model_in_sz = model_in_sz
         self.max_n_labels = max_labels
         self.transform = transform
+        self.hflip_prob = hflip_prob
         self.filter_class_ids = np.asarray(filter_class_ids) if filter_class_ids is not None else None
         self.min_pixel_area = min_pixel_area
 
@@ -89,10 +94,9 @@ class YOLODataset(Dataset):
         image, label = self.pad_and_scale(image, label)
         if self.transform:
             image = self.transform(image)
-            if np.random.random() < 0.5:  # rand horizontal flip
-                image = image.transpose(Image.Transpose.FLIP_LEFT_RIGHT)
-                if label.shape:
-                    label[:, 1] = 1 - label[:, 1]
+        if np.random.random() < self.hflip_prob:  # label aware horizontal flip
+            image = image.transpose(Image.Transpose.FLIP_LEFT_RIGHT)
+            label[:, 1] = 1 - label[:, 1]
         # filter boxes by bbox area pixels compared to the model in size (640x640 by default)
         if self.min_pixel_area is not None:
             label = label[

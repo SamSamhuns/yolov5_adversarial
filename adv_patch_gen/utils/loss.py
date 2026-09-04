@@ -5,35 +5,66 @@ import torch.nn as nn
 
 
 class MaxProbExtractor(nn.Module):
-    """MaxProbExtractor: extracts max class probability for class from YOLO output.
+    """Extracts the detection confidence the patch is optimizing against, from a YOLO head's raw output.
 
-    Module providing the functionality necessary to extract the max class probability for one class from YOLO output.
+    Handles both head layouts:
+      yolov5   [batch, n_preds, 5 + n_classes]  xywh, objectness, per class scores (all sigmoid activated)
+      yolov8+  [batch, 4 + n_classes, n_preds]  xywh, per class scores, transposed and with no objectness
 
+    config keys used:
+        n_classes: number of classes the detector predicts
+        objective_class_id: None for an untargeted attack, else an int or list of class ids to suppress
+        loss_target: callable(objectness, class_conf) chosen by the loss_target config string
+        loss_topk: mean of the k highest scoring predictions per image. 1 reproduces the original max.
     """
 
     def __init__(self, config):
         super(MaxProbExtractor, self).__init__()
         self.config = config
+        cls_id = config.objective_class_id
+        self.objective_class_ids = None if cls_id is None else ([cls_id] if isinstance(cls_id, int) else list(cls_id))
+        self.topk = max(1, int(getattr(config, "loss_topk", 1) or 1))
+        self._warned_no_objectness = False
+
+    def _split_head(self, output: torch.Tensor):
+        """Return (objectness, class_confs) as [batch, n_preds] and [batch, n_preds, n_classes]."""
+        n_cls = self.config.n_classes
+        if output.size(-1) == 5 + n_cls:  # yolov5
+            return output[..., 4], output[..., 5 : 5 + n_cls]
+        if output.size(1) == 4 + n_cls:  # yolov8/v11, transposed and without an objectness channel
+            preds = output.transpose(1, 2)  # [batch, n_preds, 4 + n_classes]
+            class_confs = preds[..., 4 : 4 + n_cls]
+            if not self._warned_no_objectness:
+                print(
+                    "NOTE: detector head has no objectness channel, objectness is treated as 1. "
+                    'Use loss_target "cls" or "obj * cls", "obj" alone carries no gradient for this head.'
+                )
+                self._warned_no_objectness = True
+            return torch.ones_like(class_confs[..., 0]), class_confs
+        raise ValueError(
+            f"Unrecognized detector output {tuple(output.shape)} for n_classes={n_cls}. "
+            f"Expected [batch, n_preds, {5 + n_cls}] (yolov5) or [batch, {4 + n_cls}, n_preds] (yolov8+)."
+        )
 
     def forward(self, output: torch.Tensor):
-        """Output must be of the shape [batch, -1, 5 + num_cls]"""
-        # get values necessary for transformation
-        assert output.size(-1) == (5 + self.config.n_classes)
+        """Output is the raw head tensor, see _split_head for the layouts accepted."""
+        objectness_score, class_confs = self._split_head(output)
 
-        class_confs = output[:, :, 5 : 5 + self.config.n_classes]  # [batch, -1, n_classes]
-        objectness_score = output[:, :, 4]  # [batch, -1, 5 + num_cls] -> [batch, -1], no need to run sigmoid here
-
-        if self.config.objective_class_id is not None:
-            # yolov5 inference output is already sigmoid activated, so class_confs are probs in [0, 1].
-            # only select the conf score for the objective class
-            class_confs = class_confs[:, :, self.config.objective_class_id]
+        if self.objective_class_ids is not None:
+            # head output is already sigmoid activated, so class_confs are per class probs in [0, 1].
+            # take the best of the targeted classes for each prediction
+            class_confs = class_confs[..., self.objective_class_ids].max(dim=2)[0]
         else:
             # get class with highest conf for each box if objective_class_id is None
-            class_confs = torch.max(class_confs, dim=2)[0]  # [batch, -1, 4] -> [batch, -1]
+            class_confs = torch.max(class_confs, dim=2)[0]  # [batch, n_preds, n_classes] -> [batch, n_preds]
 
         confs_if_object = self.config.loss_target(objectness_score, class_confs)
-        max_conf, _ = torch.max(confs_if_object, dim=1)
-        return max_conf
+        if self.topk == 1:
+            return torch.max(confs_if_object, dim=1)[0]
+        # mean of the topk highest scoring predictions, so more than one prediction per image
+        # gets gradient. A single max sends gradient to 1 of ~25k predictions at 640x640.
+        k = min(self.topk, confs_if_object.size(1))
+        return torch.topk(confs_if_object, k, dim=1)[0].mean(dim=1)
 
 
 class SaliencyLoss(nn.Module):
@@ -98,9 +129,7 @@ class NPSLoss(nn.Module):
 
     def __init__(self, triplet_scores_fpath: str):
         super(NPSLoss, self).__init__()
-        self.printability_array = nn.Parameter(
-            self.get_printability_array(triplet_scores_fpath), requires_grad=False
-        )
+        self.printability_array = nn.Parameter(self.get_printability_array(triplet_scores_fpath), requires_grad=False)
 
     def forward(self, adv_patch):
         # calculate euclidean distance between colors in patch and colors in printability_array
