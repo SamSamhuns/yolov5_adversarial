@@ -11,6 +11,7 @@
     "weights_file": "runs/weights/best.pt",
     "triplet_printfile": "triplets.csv",
     "device": "cuda:0",                     # (str): 'cpu' or 'cuda' or 'cuda:0,1,2,3'
+    "seed": 42,                             # int: RNG seed for repeatability. Use null for a non deterministic run. Defaults to 42 when omitted
     "use_amp": true,
     "patch_name": "base",
     "val_epoch_freq": 100,
@@ -38,7 +39,8 @@
     "max_labels": 48,
     "start_lr": 0.03,
     "min_tv_loss": 0.1,
-    "sal_mult": 1.0,
+    "sal_mult": 1.0,                        # float: saliency (colorfulness) loss weight. The loss is an absolute metric in ~[0, 1],
+                                            # i.e. on the same scale as the det loss, so retune this if your config predates that fix
     "tv_mult": 2.5,
     "nps_mult": 0.01,                       # float: Use 0.01 when not using sal. With sal use 0.001
     "batch_size": 8,

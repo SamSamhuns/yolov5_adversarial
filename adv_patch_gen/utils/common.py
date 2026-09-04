@@ -1,9 +1,11 @@
 """Common utils."""
 
+import random
 import socket
-from typing import Tuple, Union
+from typing import Optional, Tuple, Union
 
 import numpy as np
+import torch
 from PIL import Image
 
 IMG_EXTNS = {".png", ".jpg", ".jpeg"}
@@ -25,6 +27,16 @@ class BColors:
     ENDC = "\033[0m"
     BOLD = "\033[1m"
     UNDERLINE = "\033[4m"
+
+
+def set_seed(seed: Optional[int]) -> None:
+    """Seed python, numpy and torch RNGs for repeatability. A None seed leaves them untouched."""
+    if seed is None:
+        return
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
 
 
 def is_port_in_use(port: int) -> bool:

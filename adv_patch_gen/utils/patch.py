@@ -66,8 +66,9 @@ class PatchTransformer(nn.Module):
             adv_patch = adv_patch * mul_gau + add_gau
         adv_patch = self.medianpooler(adv_patch.unsqueeze(0))
         m_h, m_w = model_in_sz
-        # Determine size of padding
-        pad = (m_w - adv_patch.size(-1)) / 2
+        # Determine size of padding, per axis so non-square patches/inputs stay centered
+        pad_w = (m_w - adv_patch.size(-1)) / 2
+        pad_h = (m_h - adv_patch.size(-2)) / 2
         # Make a batch of patches
         adv_patch = adv_patch.unsqueeze(0)
         adv_batch = adv_patch.expand(
@@ -95,18 +96,13 @@ class PatchTransformer(nn.Module):
 
             adv_batch = torch.clamp(adv_batch, 0.000001, 0.99999)
 
-        # Where the label class_id is 1 we don't want a patch (padding) --> fill mask with zero's
-        cls_ids = lab_batch[..., 0].unsqueeze(-1)  # equiv to torch.narrow(lab_batch, 2, 0, 1)
-        cls_mask = cls_ids.expand(-1, -1, p_c)
-        cls_mask = cls_mask.unsqueeze(-1)
-        cls_mask = cls_mask.expand(-1, -1, -1, adv_batch.size(3))
-        cls_mask = cls_mask.unsqueeze(-1)
+        # lab_batch is zero-padded up to max_labels, so drop patches for the zero area filler rows
+        valid_box = (lab_batch[..., 3] * lab_batch[..., 4]) > 0  # [bsize, max_bbox_labels]
         # [bsize, max_bbox_labels, pchannel, pheight, pwidth]
-        cls_mask = cls_mask.expand(-1, -1, -1, -1, adv_batch.size(4))
-        msk_batch = self.tensor(cls_mask.size()).fill_(1)
+        msk_batch = valid_box[:, :, None, None, None].to(adv_batch.dtype).expand_as(adv_batch)
 
         # Pad patch and mask to image dimensions
-        patch_pad = nn.ConstantPad2d((int(pad + 0.5), int(pad), int(pad + 0.5), int(pad)), 0)
+        patch_pad = nn.ConstantPad2d((int(pad_w + 0.5), int(pad_w), int(pad_h + 0.5), int(pad_h)), 0)
         adv_batch = patch_pad(adv_batch)
         msk_batch = patch_pad(msk_batch)
 
@@ -119,15 +115,12 @@ class PatchTransformer(nn.Module):
 
         # Resizes and rotates
         current_patch_size = adv_patch.size(-1)
-        lab_batch_scaled = self.tensor(lab_batch.size()).fill_(0)
-        lab_batch_scaled[:, :, 1] = lab_batch[:, :, 1] * m_w
-        lab_batch_scaled[:, :, 2] = lab_batch[:, :, 2] * m_w
-        lab_batch_scaled[:, :, 3] = lab_batch[:, :, 3] * m_w
-        lab_batch_scaled[:, :, 4] = lab_batch[:, :, 4] * m_w
         tsize = np.random.uniform(*self.t_size_frac)
-        target_size = torch.sqrt(
-            ((lab_batch_scaled[:, :, 3].mul(tsize)) ** 2) + ((lab_batch_scaled[:, :, 4].mul(tsize)) ** 2)
-        )
+        # patch is sized off the bbox diagonal in model input pixels
+        target_size = tsize * torch.sqrt(((lab_batch[:, :, 3] * m_w) ** 2) + ((lab_batch[:, :, 4] * m_h) ** 2))
+        # zero area filler rows would give scale 0 and hence inf in theta below, so give them a
+        # unit scale instead. Their patches are zeroed out by msk_batch after grid_sample.
+        target_size = torch.where(valid_box, target_size, torch.full_like(target_size, current_patch_size))
 
         target_x = lab_batch[:, :, 1].view(np.prod(batch_size))
         target_y = lab_batch[:, :, 2].view(np.prod(batch_size))
@@ -136,14 +129,15 @@ class PatchTransformer(nn.Module):
         if rand_loc:
             off_x = targetoff_x * (self.tensor(targetoff_x.size()).uniform_(*self.x_off_loc))
             target_x = target_x + off_x
-            off_y = targetoff_y * (self.tensor(targetoff_y.size()).uniform_(*self.x_off_loc))
+            off_y = targetoff_y * (self.tensor(targetoff_y.size()).uniform_(*self.y_off_loc))
             target_y = target_y + off_y
         scale = target_size / current_patch_size
         scale = scale.view(anglesize)
 
         s = adv_batch.size()
         adv_batch = adv_batch.view(s[0] * s[1], s[2], s[3], s[4])
-        msk_batch = msk_batch.view(s[0] * s[1], s[2], s[3], s[4])
+        # reshape not view: msk_batch is an expanded view when padding is a no-op
+        msk_batch = msk_batch.reshape(s[0] * s[1], s[2], s[3], s[4])
 
         tx = (-target_x + 0.5) * 2
         ty = (-target_y + 0.5) * 2
@@ -160,9 +154,9 @@ class PatchTransformer(nn.Module):
         theta[:, 1, 1] = cos / scale
         theta[:, 1, 2] = -tx * sin / scale + ty * cos / scale
 
-        grid = F.affine_grid(theta, adv_batch.shape)
-        adv_batch_t = F.grid_sample(adv_batch, grid)
-        msk_batch_t = F.grid_sample(msk_batch, grid)
+        grid = F.affine_grid(theta, adv_batch.shape, align_corners=False)
+        adv_batch_t = F.grid_sample(adv_batch, grid, align_corners=False)
+        msk_batch_t = F.grid_sample(msk_batch, grid, align_corners=False)
 
         adv_batch_t = adv_batch_t.view(s[0], s[1], s[2], s[3], s[4])
         msk_batch_t = msk_batch_t.view(s[0], s[1], s[2], s[3], s[4])

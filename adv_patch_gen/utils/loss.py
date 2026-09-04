@@ -26,8 +26,7 @@ class MaxProbExtractor(nn.Module):
         objectness_score = output[:, :, 4]  # [batch, -1, 5 + num_cls] -> [batch, -1], no need to run sigmoid here
 
         if self.config.objective_class_id is not None:
-            # norm probs for object classes to [0, 1]
-            class_confs = torch.nn.Softmax(dim=2)(class_confs)
+            # yolov5 inference output is already sigmoid activated, so class_confs are probs in [0, 1].
             # only select the conf score for the objective class
             class_confs = class_confs[:, :, self.config.objective_class_id]
         else:
@@ -43,7 +42,8 @@ class SaliencyLoss(nn.Module):
     """
     Implementation of the colorfulness metric as the saliency loss.
 
-    The smaller the value, the less colorful the image.
+    The smaller the value, the less colorful the image. The metric is already scale invariant
+    (it is a statistic over the opponent color channels), so it is not normalized by patch size.
     Reference: https://infoscience.epfl.ch/record/33994/files/HaslerS03.pdf
     """
 
@@ -62,8 +62,7 @@ class SaliencyLoss(nn.Module):
 
         mu_rg, sigma_rg = torch.mean(rg) + 1e-8, torch.std(rg) + 1e-8
         mu_yb, sigma_yb = torch.mean(yb) + 1e-8, torch.std(yb) + 1e-8
-        sl = torch.sqrt(sigma_rg**2 + sigma_yb**2) + (0.3 * torch.sqrt(mu_rg**2 + mu_yb**2))
-        return sl / torch.numel(adv_patch)
+        return torch.sqrt(sigma_rg**2 + sigma_yb**2) + (0.3 * torch.sqrt(mu_rg**2 + mu_yb**2))
 
 
 class TotalVariationLoss(nn.Module):

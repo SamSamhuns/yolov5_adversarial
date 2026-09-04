@@ -9,6 +9,7 @@
     "weights_file": "runs/train/s_coco_e300_4Class_Vehicle/weights/best.pt",
     "triplet_printfile": "adv_patch_gen/utils/30_rgb_triplets.csv",
     "device": "cuda:0",
+    "seed": 42,
     "use_amp": true,
     "patch_name": "base",
     "val_epoch_freq": 100,

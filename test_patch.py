@@ -5,7 +5,6 @@ import io
 import json
 import os
 import os.path as osp
-import random
 import time
 from contextlib import redirect_stdout
 from pathlib import Path
@@ -20,7 +19,7 @@ from pycocotools.coco import COCO
 from pycocotools.cocoeval import COCOeval
 from torchvision import transforms
 
-from adv_patch_gen.utils.common import IMG_EXTNS, BColors, pad_to_square
+from adv_patch_gen.utils.common import IMG_EXTNS, BColors, pad_to_square, set_seed
 from adv_patch_gen.utils.config_parser import get_argparser, load_config_object
 from adv_patch_gen.utils.patch import PatchApplier, PatchTransformer
 from adv_patch_gen.utils.video import (
@@ -34,13 +33,6 @@ from utils.metrics import ConfusionMatrix
 from utils.plots import Annotator, colors
 from utils.torch_utils import select_device
 
-# optionally set seed for repeatability
-SEED = 42
-if SEED is not None:
-    random.seed(SEED)
-    np.random.seed(SEED)
-    torch.manual_seed(SEED)
-    torch.cuda.manual_seed(SEED)
 torch.backends.cudnn.benchmark = False
 
 
@@ -52,16 +44,31 @@ def eval_coco_metrics(anno_json: str, pred_json: str, txt_save_path: str, w_mode
 
     evaluator.evaluate()
     evaluator.accumulate()
-    evaluator.summarize()
 
-    # capture evaluator stats and save to file
+    # capture evaluator stats once, then print and save them
     std_out = io.StringIO()
     with redirect_stdout(std_out):
         evaluator.summarize()
     eval_stats = std_out.getvalue()
+    print(eval_stats)
     with open(txt_save_path, w_mode, encoding="utf-8") as fwriter:
         fwriter.write(eval_stats)
     return evaluator.stats
+
+
+def conf_matrix_tp_fp(conf_matrix: ConfusionMatrix) -> Tuple[np.ndarray, np.ndarray]:
+    """Per class true and false positives from a confusion matrix, excluding the background class."""
+    tp = conf_matrix.matrix.diagonal()
+    fp = conf_matrix.matrix.sum(1) - tp
+    return tp[:-1], fp[:-1]
+
+
+def plot_conf_matrix(conf_matrix: ConfusionMatrix, save_dir: str, class_list: List[str], save_name: str) -> None:
+    """Plot a confusion matrix to save_dir/save_name. ConfusionMatrix.plot() always writes confusion_matrix.png."""
+    conf_matrix.plot(save_dir=save_dir, names=class_list)
+    default_path = osp.join(save_dir, "confusion_matrix.png")
+    if osp.isfile(default_path):
+        os.replace(default_path, osp.join(save_dir, save_name))
 
 
 class PatchTester:
@@ -83,6 +90,7 @@ class PatchTester:
         boxes,
         boxes_pred,
         class_list: List[str],
+        conf_thresh: float = 0.25,
         lo_area: float = 20**2,
         hi_area: float = 67**2,
         cls_id: Optional[int] = None,
@@ -98,6 +106,7 @@ class PatchTester:
             boxes: torch.Tensor, first pass boxes (gt unpatched boxes) [class, x1, y1, x2, y2]
             boxes_pred: torch.Tensor, second pass boxes (patched boxes) [x1, y1, x2, y2, conf, class]
             class_list: list of class names in correct order
+            conf_thresh: confidence threshold used for the detections, forwarded to the confusion matrix
             lo_area: small bbox area threshold
             hi_area: large bbox area threshold
             cls_id: filter for a particular class
@@ -124,19 +133,19 @@ class PatchTester:
         assert (bp_small.shape[0] + bp_med.shape[0] + bp_large.shape[0]) == boxes_pred.shape[0]
         assert (b_small.shape[0] + b_med.shape[0] + b_large.shape[0]) == boxes.shape[0]
 
-        conf_matrix = ConfusionMatrix(len(class_list))
+        conf_matrix = ConfusionMatrix(len(class_list), conf=conf_thresh)
         conf_matrix.process_batch(bp_small, b_small)
-        tps_small, fps_small = conf_matrix.tp_fp()
-        conf_matrix = ConfusionMatrix(len(class_list))
+        tps_small, fps_small = conf_matrix_tp_fp(conf_matrix)
+        conf_matrix = ConfusionMatrix(len(class_list), conf=conf_thresh)
         conf_matrix.process_batch(bp_med, b_med)
-        tps_med, fps_med = conf_matrix.tp_fp()
-        conf_matrix = ConfusionMatrix(len(class_list))
+        tps_med, fps_med = conf_matrix_tp_fp(conf_matrix)
+        conf_matrix = ConfusionMatrix(len(class_list), conf=conf_thresh)
         conf_matrix.process_batch(bp_large, b_large)
-        tps_large, fps_large = conf_matrix.tp_fp()
+        tps_large, fps_large = conf_matrix_tp_fp(conf_matrix)
         if recompute_asr_all:
-            conf_matrix = ConfusionMatrix(len(class_list))
+            conf_matrix = ConfusionMatrix(len(class_list), conf=conf_thresh)
             conf_matrix.process_batch(boxes_pred, boxes)
-            tps_all, fps_all = conf_matrix.tp_fp()
+            tps_all, fps_all = conf_matrix_tp_fp(conf_matrix)
         else:
             tps_all, fps_all = tps_small + tps_med + tps_large, fps_small + fps_med + fps_large
 
@@ -202,6 +211,7 @@ class PatchTester:
         save_plots: bool = False,
         save_video: bool = False,
         max_images: int = 100000,
+        apply_patch_transforms: bool = True,
     ) -> dict:
         """
         Initiate test for properly, randomly and no-patched images
@@ -217,6 +227,7 @@ class PatchTester:
             min_pixel_area: all bounding boxes having area less than this are filtered out during testing. if None, use all boxes
             save_video: if set to true, eval videos are saved in directory videos
             max_images: max number of images to evaluate from inside imgdir
+            apply_patch_transforms: apply rotation, location shift, brightness and contrast transforms to the patch
         Returns:
             dict of patch and noise coco_map and asr results
         """
@@ -281,9 +292,6 @@ class PatchTester:
         all_patch_preds = []
         all_noise_preds = []
         det_boxes = dropped_boxes = 0
-
-        # apply rotation, location shift, brightness, contrast transforms for patch
-        apply_patch_transforms = True
 
         #### iterate through all images ####
         box_id = 0
@@ -511,7 +519,6 @@ class PatchTester:
                 else:
                     p_img_pil.save(osp.join(random_img_dir, randompatchedname))
 
-        del adv_batch_t, padded_img_tensor, p_tensor_batch
         torch.cuda.empty_cache()
 
         # reorder labels to (Array[M, 5]), class, x1, y1, x2, y2
@@ -522,17 +529,13 @@ class PatchTester:
 
         # Calc confusion matrices if not class_agnostic
         if not class_agnostic and save_plots:
-            patch_confusion_matrix = ConfusionMatrix(len(self.cfg.class_list))
+            patch_confusion_matrix = ConfusionMatrix(len(self.cfg.class_list), conf=conf_thresh)
             patch_confusion_matrix.process_batch(all_patch_preds, all_labels)
-            noise_confusion_matrix = ConfusionMatrix(len(self.cfg.class_list))
+            noise_confusion_matrix = ConfusionMatrix(len(self.cfg.class_list), conf=conf_thresh)
             noise_confusion_matrix.process_batch(all_noise_preds, all_labels)
 
-            patch_confusion_matrix.plot(
-                save_dir=self.cfg.savedir, names=self.cfg.class_list, save_name="conf_matrix_patch.png"
-            )
-            noise_confusion_matrix.plot(
-                save_dir=self.cfg.savedir, names=self.cfg.class_list, save_name="conf_matrix_noise.png"
-            )
+            plot_conf_matrix(patch_confusion_matrix, self.cfg.savedir, self.cfg.class_list, "conf_matrix_patch.png")
+            plot_conf_matrix(noise_confusion_matrix, self.cfg.savedir, self.cfg.class_list, "conf_matrix_noise.png")
 
         # add all required fields for a reference GT clean annotation
         clean_gt_results_json = {"annotations": clean_gt_results, "categories": [], "images": clean_image_annotations}
@@ -566,7 +569,12 @@ class PatchTester:
         coco_map_patch = eval_coco_metrics(clean_gt_json, patch_json, patch_txt_path) if patch_results else []
 
         asr_s, asr_m, asr_l, asr_a = PatchTester.calc_asr(
-            all_labels, all_patch_preds, self.cfg.class_list, cls_id=cls_id, class_agnostic=class_agnostic
+            all_labels,
+            all_patch_preds,
+            self.cfg.class_list,
+            conf_thresh=conf_thresh,
+            cls_id=cls_id,
+            class_agnostic=class_agnostic,
         )
         with open(patch_txt_path, "a", encoding="utf-8") as f_patch:
             asr_str = ""
@@ -579,10 +587,15 @@ class PatchTester:
         metrics_patch = {"coco_map": coco_map_patch, "asr": [asr_s, asr_m, asr_l, asr_a]}
 
         print(f"{BColors.HEADER}### Metrics for images with random noise patches ###{BColors.ENDC}")
-        coco_map_noise = eval_coco_metrics(clean_gt_json, noise_json, noise_txt_path) if clean_results else []
+        coco_map_noise = eval_coco_metrics(clean_gt_json, noise_json, noise_txt_path) if noise_results else []
 
         asr_s, asr_m, asr_l, asr_a = PatchTester.calc_asr(
-            all_labels, all_noise_preds, self.cfg.class_list, cls_id=cls_id, class_agnostic=class_agnostic
+            all_labels,
+            all_noise_preds,
+            self.cfg.class_list,
+            conf_thresh=conf_thresh,
+            cls_id=cls_id,
+            class_agnostic=class_agnostic,
         )
         with open(noise_txt_path, "a", encoding="utf-8") as f_noise:
             asr_str = ""
@@ -634,9 +647,10 @@ def main():
         type=float,
         nargs="+",
         dest="target_size_frac",
-        default=[0.3],
+        default=None,
         required=False,
-        help="Patch target_size_frac of the bbox area. Providing two values sets a range. (default: %(default)s)",
+        help="Patch target_size_frac of the bbox area. Two values set a range. "
+        'If unset, use "target_size_frac" in cfg json (default: %(default)s)',
     )
     parser.add_argument(
         "-w",
@@ -682,6 +696,20 @@ def main():
         help="Conf threshold for detection (default: %(default)s)",
     )
     parser.add_argument(
+        "--nms-thresh",
+        type=float,
+        dest="nms_thresh",
+        default=0.4,
+        required=False,
+        help="IoU threshold for NMS (default: %(default)s)",
+    )
+    parser.add_argument(
+        "--no-patch-transforms",
+        dest="no_patch_transforms",
+        action="store_true",
+        help="Disable the random rotation, location shift, brightness and contrast transforms on the patch",
+    )
+    parser.add_argument(
         "--save-txt",
         dest="savetxt",
         action="store_true",
@@ -697,7 +725,7 @@ def main():
         help="Combine no-patch, random-patch and proper-patched images into videos",
     )
     parser.add_argument(
-        "--save-plot", dest="saveplots", action="store_true", help="Save the confusion matrix plots, PR, P & R curves"
+        "--save-plot", dest="saveplots", action="store_true", help="Save the patch and noise confusion matrix plots"
     )
     parser.add_argument(
         "--class-agnostic",
@@ -724,17 +752,18 @@ def main():
 
     args = parser.parse_args()
     cfg = load_config_object(args.config)
+    set_seed(cfg.get("seed", 42))
     cfg.device = args.device if args.device is not None else cfg.device
     cfg.weights_file = (
         args.weights if args.weights is not None else cfg.weights_file
     )  # check if cfg.weights_file is ignored
     cfg.patchfile = args.patchfile
     cfg.imgdir = args.imgdir
-    args.target_size_frac = args.target_size_frac[0] if len(args.target_size_frac) == 1 else args.target_size_frac
-    cfg.target_size_frac = args.target_size_frac
+    if args.target_size_frac is not None:
+        if len(args.target_size_frac) not in {1, 2}:
+            raise ValueError("target_size_frac can only have one or two values")
+        cfg.target_size_frac = args.target_size_frac[0] if len(args.target_size_frac) == 1 else args.target_size_frac
 
-    if not isinstance(args.target_size_frac, float) and len(args.target_size_frac) != 2:
-        raise ValueError("target_size_frac can only have one or two values")
     if args.savevideo and not args.saveimg:
         raise ValueError("To save videos, images must also be saved pass both --save-img & --save-vid flags")
     savename = f'{time.strftime("%Y%m%d-%H%M%S")}_' + cfg.patch_name
@@ -754,6 +783,7 @@ def main():
     tester = PatchTester(cfg)
     tester.test(
         conf_thresh=args.conf_thresh,
+        nms_thresh=args.nms_thresh,
         save_txt=args.savetxt,
         save_image=args.saveimg,
         class_agnostic=args.class_agnostic,
@@ -761,6 +791,7 @@ def main():
         min_pixel_area=args.min_pixel_area,
         save_plots=args.saveplots,
         save_video=args.savevideo,
+        apply_patch_transforms=not args.no_patch_transforms,
     )
 
 

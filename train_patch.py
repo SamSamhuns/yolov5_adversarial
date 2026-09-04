@@ -8,9 +8,7 @@ import glob
 import json
 import os
 import os.path as osp
-import random
 import time
-from contextlib import nullcontext
 
 import numpy as np
 import torch
@@ -19,12 +17,11 @@ from easydict import EasyDict as edict
 from PIL import Image
 from tensorboard import program
 from torch import autograd, optim
-from torch.cuda.amp import autocast
 from torch.utils.tensorboard import SummaryWriter
 from torchvision import transforms as T
 from tqdm import tqdm
 
-from adv_patch_gen.utils.common import IMG_EXTNS, is_port_in_use, pad_to_square
+from adv_patch_gen.utils.common import IMG_EXTNS, is_port_in_use, pad_to_square, set_seed
 from adv_patch_gen.utils.config_parser import get_argparser, load_config_object
 from adv_patch_gen.utils.dataset import YOLODataset
 from adv_patch_gen.utils.loss import MaxProbExtractor, NPSLoss, SaliencyLoss, TotalVariationLoss
@@ -32,15 +29,8 @@ from adv_patch_gen.utils.patch import PatchApplier, PatchTransformer
 from models.common import DetectMultiBackend
 from test_patch import PatchTester
 from utils.general import non_max_suppression, xyxy2xywh
-from utils.torch_utils import select_device
+from utils.torch_utils import GradScaler, select_device, smart_amp_autocast
 
-# optionally set seed for repeatability
-SEED = None
-if SEED is not None:
-    random.seed(SEED)
-    np.random.seed(SEED)
-    torch.manual_seed(SEED)
-    torch.cuda.manual_seed(SEED)
 # setting benchmark to False reduces training time for our setup
 torch.backends.cudnn.benchmark = False
 
@@ -131,7 +121,7 @@ class PatchTrainer:
             pil_img_mode: Pillow image modes i.e. RGB, L https://pillow.readthedocs.io/en/latest/handbook/concepts.html#modes
         """
         p_c = 1 if pil_img_mode in {"L"} else 3
-        p_w, p_h = self.cfg.patch_size
+        p_h, p_w = self.cfg.patch_size
         if patch_type == "gray":
             adv_patch_cpu = torch.full((p_c, p_h, p_w), 0.5)
         elif patch_type == "random":
@@ -184,10 +174,15 @@ class PatchTrainer:
             adv_patch_cpu = self.generate_patch("random", self.cfg.patch_img_mode)
         else:
             adv_patch_cpu = self.read_image(self.cfg.patch_src, self.cfg.patch_img_mode)
-        adv_patch_cpu.requires_grad = True
+        adv_patch = adv_patch_cpu.to(self.dev).requires_grad_(True)
 
-        optimizer = optim.Adam([adv_patch_cpu], lr=self.cfg.start_lr, amsgrad=True)
+        optimizer = optim.Adam([adv_patch], lr=self.cfg.start_lr, amsgrad=True)
         scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, "min", patience=50)
+        # AMP is a cuda only path both here and in the yolov5 helpers
+        use_amp = self.cfg.use_amp and self.dev.type == "cuda"
+        if self.cfg.use_amp and not use_amp:
+            print(f"WARNING: use_amp is set but device is {self.dev.type}, running without AMP")
+        scaler = GradScaler(enabled=use_amp)
 
         start_time = time.time()
         for epoch in range(1, self.cfg.n_epochs + 1):
@@ -202,7 +197,6 @@ class PatchTrainer:
                 with autograd.set_detect_anomaly(mode=True if self.cfg.debug_mode else False):
                     img_batch = img_batch.to(self.dev, non_blocking=True)
                     lab_batch = lab_batch.to(self.dev, non_blocking=True)
-                    adv_patch = adv_patch_cpu.to(self.dev, non_blocking=True)
                     adv_batch_t = self.patch_transformer(
                         adv_patch,
                         lab_batch,
@@ -224,7 +218,7 @@ class PatchTrainer:
                         img = T.ToPILImage()(img.detach().cpu())
                         img.save(osp.join(self.cfg.log_dir, "train_patch_applied_imgs", f"b_{i_batch}.jpg"))
 
-                    with autocast() if self.cfg.use_amp else nullcontext():
+                    with smart_amp_autocast(use_amp):
                         output = self.model(p_img_batch)[0]
                         max_prob = self.prob_extractor(output)
                         sal = self.sal_loss(adv_patch) if self.cfg.sal_mult != 0 else zero_tensor
@@ -239,12 +233,13 @@ class PatchTrainer:
                     loss = det_loss + sal_loss + nps_loss + tv_loss
                     ep_loss += loss
 
-                    loss.backward()
-                    optimizer.step()
+                    scaler.scale(loss).backward()
+                    scaler.step(optimizer)
+                    scaler.update()
                     optimizer.zero_grad(set_to_none=True)
                     # keep patch in cfg image pixel range
                     pl, ph = self.cfg.patch_pixel_range
-                    adv_patch_cpu.data.clamp_(pl / 255, ph / 255)
+                    adv_patch.data.clamp_(pl / 255, ph / 255)
 
                     if i_batch % self.cfg.tensorboard_batch_log_interval == 0:
                         iteration = self.epoch_length * epoch + i_batch
@@ -255,7 +250,7 @@ class PatchTrainer:
                         self.writer.add_scalar("loss/tv_loss", tv_loss.detach().cpu().numpy(), iteration)
                         self.writer.add_scalar("misc/epoch", epoch, iteration)
                         self.writer.add_scalar("misc/learning_rate", optimizer.param_groups[0]["lr"], iteration)
-                        self.writer.add_image("patch", adv_patch_cpu, iteration)
+                        self.writer.add_image("patch", adv_patch, iteration)
                     if i_batch + 1 < len(self.train_loader):
                         del adv_batch_t, output, max_prob, det_loss, p_img_batch, sal_loss, nps_loss, tv_loss, loss
                         # torch.cuda.empty_cache()  # note emptying cache adds too much overhead
@@ -264,7 +259,7 @@ class PatchTrainer:
 
             # save patch after every patch_save_epoch_freq epochs
             if epoch % self.cfg.patch_save_epoch_freq == 0:
-                img = T.ToPILImage(self.cfg.patch_img_mode)(adv_patch_cpu)
+                img = T.ToPILImage(self.cfg.patch_img_mode)(adv_patch.detach().cpu())
                 img.save(out_patch_path)
                 del adv_batch_t, output, max_prob, det_loss, p_img_batch, sal_loss, nps_loss, tv_loss, loss
                 # torch.cuda.empty_cache()  # note emptying cache adds too much overhead
@@ -280,8 +275,7 @@ class PatchTrainer:
         # load patch from file
         patch_img = Image.open(patchfile).convert(self.cfg.patch_img_mode)
         patch_img = T.Resize(self.cfg.patch_size)(patch_img)
-        adv_patch_cpu = T.ToTensor()(patch_img)
-        adv_patch = adv_patch_cpu.to(self.dev)
+        adv_patch = T.ToTensor()(patch_img).to(self.dev)
 
         img_paths = glob.glob(osp.join(self.cfg.val_image_dir, "*"))
         img_paths = sorted([p for p in img_paths if osp.splitext(p)[-1] in IMG_EXTNS])
@@ -372,7 +366,7 @@ class PatchTrainer:
         # patch and noise labels are of shapes (Array[N, 6]), x1, y1, x2, y2, conf, class
         all_patch_preds = torch.cat(all_patch_preds)
         asr_s, asr_m, asr_l, asr_a = PatchTester.calc_asr(
-            all_labels, all_patch_preds, class_list=self.cfg.class_list, cls_id=cls_id
+            all_labels, all_patch_preds, class_list=self.cfg.class_list, cls_id=cls_id, conf_thresh=conf_thresh
         )
 
         print("Validation metrics for images with patches:")
@@ -384,7 +378,6 @@ class PatchTrainer:
         self.writer.add_scalar("val_asr_per_epoch/area_medium", asr_m, epoch)
         self.writer.add_scalar("val_asr_per_epoch/area_large", asr_l, epoch)
         self.writer.add_scalar("val_asr_per_epoch/area_all", asr_a, epoch)
-        del adv_batch_t, padded_img_tensor, p_tensor_batch
         torch.cuda.empty_cache()
         self.patch_transformer.t_size_frac = train_t_size_frac
 
@@ -393,6 +386,7 @@ def main():
     parser = get_argparser()
     args = parser.parse_args()
     cfg = load_config_object(args.config)
+    set_seed(cfg.get("seed", 42))
     trainer = PatchTrainer(cfg)
     trainer.train()
 
