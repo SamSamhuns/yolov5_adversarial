@@ -46,19 +46,18 @@ COMET_UPLOAD_DATASET = os.getenv("COMET_UPLOAD_DATASET", "false").lower() == "tr
 # Evaluation Settings
 COMET_LOG_CONFUSION_MATRIX = os.getenv("COMET_LOG_CONFUSION_MATRIX", "true").lower() == "true"
 COMET_LOG_PREDICTIONS = os.getenv("COMET_LOG_PREDICTIONS", "true").lower() == "true"
-COMET_MAX_IMAGE_UPLOADS = int(os.getenv("COMET_MAX_IMAGE_UPLOADS", 100))
+COMET_MAX_IMAGE_UPLOADS = int(os.getenv("COMET_MAX_IMAGE_UPLOADS", "100"))
 
 # Confusion Matrix Settings
-CONF_THRES = float(os.getenv("CONF_THRES", 0.001))
-IOU_THRES = float(os.getenv("IOU_THRES", 0.6))
+CONF_THRES = float(os.getenv("CONF_THRES", "0.001"))
+IOU_THRES = float(os.getenv("IOU_THRES", "0.6"))
 
 # Batch Logging Settings
 COMET_LOG_BATCH_METRICS = os.getenv("COMET_LOG_BATCH_METRICS", "false").lower() == "true"
-COMET_BATCH_LOGGING_INTERVAL = os.getenv("COMET_BATCH_LOGGING_INTERVAL", 1)
-COMET_PREDICTION_LOGGING_INTERVAL = os.getenv("COMET_PREDICTION_LOGGING_INTERVAL", 1)
+COMET_BATCH_LOGGING_INTERVAL = int(os.getenv("COMET_BATCH_LOGGING_INTERVAL", "1"))
 COMET_LOG_PER_CLASS_METRICS = os.getenv("COMET_LOG_PER_CLASS_METRICS", "false").lower() == "true"
 
-RANK = int(os.getenv("RANK", -1))
+RANK = int(os.getenv("RANK", "-1"))
 
 to_pil = T.ToPILImage()
 
@@ -93,7 +92,8 @@ class CometLogger:
             "log_env_gpu": True,
             "log_env_cpu": True,
             "project_name": COMET_PROJECT_NAME,
-        } | experiment_kwargs
+            **experiment_kwargs,
+        }
         self.experiment = self._get_experiment(self.comet_mode, run_id)
         self.experiment.set_name(self.opt.name)
 
@@ -198,8 +198,6 @@ class CometLogger:
             )
             return self._get_experiment("offline", experiment_id)
 
-        return
-
     def log_metrics(self, log_dict, **kwargs):
         """Logs metrics to the current experiment, accepting a dictionary of metric names and values."""
         self.experiment.log_metrics(log_dict, **kwargs)
@@ -263,12 +261,12 @@ class CometLogger:
             return
         detections = predn[predn[:, 4] > self.conf_thres]
         iou = box_iou(labelsn[:, 1:], detections[:, :4])
-        mask, _ = torch.where(iou > self.iou_thres)
-        if len(mask) == 0:
+        label_indices, detection_indices = torch.where(iou > self.iou_thres)
+        if len(label_indices) == 0:
             return
 
-        filtered_detections = detections[mask]
-        filtered_labels = labelsn[mask]
+        filtered_detections = detections[detection_indices.unique()]
+        filtered_labels = labelsn[label_indices.unique()]
 
         image_id = path.split("/")[-1].split(".")[0]
         image_name = f"{image_id}_curr_epoch_{self.experiment.curr_epoch}"
@@ -314,17 +312,16 @@ class CometLogger:
             tbox = xywh2xyxy(labels[:, 1:5])  # target boxes
             scale_boxes(image.shape[1:], tbox, shape[0], shape[1])  # native-space labels
             labelsn = torch.cat((labels[:, 0:1], tbox), 1)  # native-space labels
-            scale_boxes(image.shape[1:], predn[:, :4], shape[0], shape[1])  # native-space pred
 
         return predn, labelsn
 
     def add_assets_to_artifact(self, artifact, path, asset_path, split):
-        """Adds image and label assets to a wandb artifact given dataset split and paths."""
+        """Adds image and label assets to a Comet artifact given dataset split and paths."""
         img_paths = sorted(glob.glob(f"{asset_path}/*"))
         label_paths = img2label_paths(img_paths)
 
         for image_file, label_file in zip(img_paths, label_paths):
-            image_logical_path, label_logical_path = map(lambda x: os.path.relpath(x, path), [image_file, label_file])
+            image_logical_path, label_logical_path = (os.path.relpath(x, path) for x in [image_file, label_file])
 
             try:
                 artifact.add(
@@ -356,7 +353,7 @@ class CometLogger:
                 metadata[key] = split_path.replace(path, "")
 
         artifact = comet_ml.Artifact(name=dataset_name, artifact_type="dataset", metadata=metadata)
-        for key in metadata.keys():
+        for key in metadata:
             if key in ["train", "val", "test"]:
                 if isinstance(self.upload_dataset, str) and (key != self.upload_dataset):
                     continue
@@ -366,8 +363,6 @@ class CometLogger:
                     artifact = self.add_assets_to_artifact(artifact, path, asset_path, key)
 
         self.experiment.log_artifact(artifact)
-
-        return
 
     def download_dataset_artifact(self, artifact_path):
         """Downloads a dataset artifact to a specified directory using the experiment's logged artifact."""
@@ -385,7 +380,7 @@ class CometLogger:
         elif isinstance(metadata_names, list):
             data_dict["names"] = {int(k): v for k, v in zip(range(len(metadata_names)), metadata_names)}
         else:
-            raise "Invalid 'names' field in dataset yaml file. Please use a list or dictionary"
+            raise ValueError("Invalid 'names' field in dataset yaml file. Please use a list or dictionary")  # noqa: TRY004
 
         return self.update_data_paths(data_dict)
 
@@ -397,7 +392,7 @@ class CometLogger:
             if data_dict.get(split):
                 split_path = data_dict.get(split)
                 data_dict[split] = (
-                    f"{path}/{split_path}" if isinstance(split, str) else [f"{path}/{x}" for x in split_path]
+                    f"{path}/{split_path}" if isinstance(split_path, str) else [f"{path}/{x}" for x in split_path]
                 )
 
         return data_dict
@@ -419,27 +414,15 @@ class CometLogger:
         """Logs hyperparameters at the start of training."""
         self.log_parameters(self.hyp)
 
-    def on_train_epoch_start(self):
-        """Called at the start of each training epoch."""
-        return
-
     def on_train_epoch_end(self, epoch):
         """Updates the current epoch in the experiment tracking at the end of each epoch."""
         self.experiment.curr_epoch = epoch
-
-        return
-
-    def on_train_batch_start(self):
-        """Called at the start of each training batch."""
-        return
 
     def on_train_batch_end(self, log_dict, step):
         """Callback function that updates and logs metrics at the end of each training batch if conditions are met."""
         self.experiment.curr_step = step
         if self.log_batch_metrics and (step % self.comet_log_batch_interval == 0):
             self.log_metrics(log_dict, step=step)
-
-        return
 
     def on_train_end(self, files, save_dir, last, best, epoch, results):
         """Logs metadata and optionally saves model files at the end of training."""
@@ -471,10 +454,6 @@ class CometLogger:
 
     def on_val_start(self):
         """Called at the start of validation, currently a placeholder with no functionality."""
-        return
-
-    def on_val_batch_start(self):
-        """Placeholder called at the start of a validation batch with no current functionality."""
         return
 
     def on_val_batch_end(self, batch_i, images, targets, paths, shapes, outputs):

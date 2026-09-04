@@ -15,9 +15,9 @@ FILE = Path(__file__).resolve()
 ROOT = FILE.parents[3]  # YOLOv5 root directory
 if str(ROOT) not in sys.path:
     sys.path.append(str(ROOT))  # add ROOT to PATH
-RANK = int(os.getenv("RANK", -1))
+RANK = int(os.getenv("RANK", "-1"))
 DEPRECATION_WARNING = (
-    f"{colorstr('wandb')}: WARNING ⚠️ wandb is deprecated and will be removed in a future release. "
+    f"{colorstr('wandb')}: wandb is deprecated and will be removed in a future release. "
     f"See supported integrations at https://github.com/ultralytics/yolov5#integrations."
 )
 
@@ -31,8 +31,7 @@ except (ImportError, AssertionError):
 
 
 class WandbLogger:
-    """
-    Log training runs, datasets, models, and predictions to Weights & Biases.
+    """Log training runs, datasets, models, and predictions to Weights & Biases.
 
     This logger sends information to W&B at wandb.ai. By default, this information includes hyperparameters, system
     configuration and metrics, model metrics, and basic data metrics and analyses.
@@ -44,18 +43,15 @@ class WandbLogger:
     """
 
     def __init__(self, opt, run_id=None, job_type="Training"):
-        """
-        - Initialize WandbLogger instance
-        - Upload dataset if opt.upload_dataset is True
-        - Setup training processes if job_type is 'Training'.
+        """- Initialize WandbLogger instance - Upload dataset if opt.upload_dataset is True - Setup training processes
+        if job_type is 'Training'.
 
-        Arguments:
-        opt (namespace) -- Commandline arguments for this run
-        run_id (str) -- Run ID of W&B run to be resumed
-        job_type (str) -- To set the job_type for this run
-
+        Args:
+            opt (namespace): Commandline arguments for this run:
+            run_id (str): Run ID of W&B run to be resumed
+            job_type (str): To set the job_type for this run
         """
-        # Pre-training routine --
+        # Pre-training routine
         self.job_type = job_type
         self.wandb, self.wandb_run = wandb, wandb.run if wandb else None
         self.val_artifact, self.train_artifact = None, None
@@ -84,48 +80,27 @@ class WandbLogger:
             self.setup_training(opt)
 
     def setup_training(self, opt):
-        """
-        Setup the necessary processes for training YOLO models:
-          - Attempt to download model checkpoint and dataset artifacts if opt.resume stats with WANDB_ARTIFACT_PREFIX
-          - Update data_dict, to contain info of previous run if resumed and the paths of dataset artifact if downloaded
-          - Setup log_dict, initialize bbox_interval.
+        """Initialize log_dict, current_epoch, and bbox_interval for a training run.
 
-        Arguments:
-        opt (namespace) -- commandline arguments for this run
-
+        Args:
+            opt (namespace): Commandline arguments for this run.
         """
         self.log_dict, self.current_epoch = {}, 0
         self.bbox_interval = opt.bbox_interval
-        if isinstance(opt.resume, str):
-            model_dir, _ = self.download_model_artifact(opt)
-            if model_dir:
-                self.weights = Path(model_dir) / "last.pt"
-                config = self.wandb_run.config
-                opt.weights, opt.save_period, opt.batch_size, opt.bbox_interval, opt.epochs, opt.hyp, opt.imgsz = (
-                    str(self.weights),
-                    config.save_period,
-                    config.batch_size,
-                    config.bbox_interval,
-                    config.epochs,
-                    config.hyp,
-                    config.imgsz,
-                )
-
         if opt.bbox_interval == -1:
             self.bbox_interval = opt.bbox_interval = (opt.epochs // 10) if opt.epochs > 10 else 1
             if opt.evolve or opt.noplots:
                 self.bbox_interval = opt.bbox_interval = opt.epochs + 1  # disable bbox_interval
 
     def log_model(self, path, opt, epoch, fitness_score, best_model=False):
-        """
-        Log the model checkpoint as W&B artifact.
+        """Log the model checkpoint as W&B artifact.
 
-        Arguments:
-        path (Path)   -- Path of directory containing the checkpoints
-        opt (namespace) -- Command line arguments for this run
-        epoch (int)  -- Current epoch number
-        fitness_score (float) -- fitness score for current epoch
-        best_model (boolean) -- Boolean representing if the current checkpoint is the best yet.
+        Args:
+            path (Path): Path of directory containing the checkpoints
+            opt (namespace): Command line arguments for this run
+            epoch (int): Current epoch number
+            fitness_score (float): fitness score for current epoch
+            best_model (boolean): Boolean representing if the current checkpoint is the best yet.
         """
         model_artifact = wandb.Artifact(
             f"run_{wandb.run.id}_model",
@@ -151,28 +126,18 @@ class WandbLogger:
         )
         LOGGER.info(f"Saving model artifact on epoch {epoch + 1}")
 
-    def val_one_image(self, pred, predn, path, names, im):
-        """Evaluates model prediction for a single image, returning metrics and visualizations."""
-        pass
-
     def log(self, log_dict):
-        """
-        Save the metrics to the logging dictionary.
+        """Save the metrics to the logging dictionary.
 
-        Arguments:
-        log_dict (Dict) -- metrics/media to be logged in current step
+        Args:
+            log_dict (Dict): metrics/media to be logged in current step
         """
         if self.wandb_run:
             for key, value in log_dict.items():
                 self.log_dict[key] = value
 
     def end_epoch(self):
-        """
-        Commit the log_dict, model artifacts and Tables to W&B and flush the log_dict.
-
-        Arguments:
-        best_result (boolean): Boolean representing if the result of this evaluation is best or not
-        """
+        """Commit the accumulated log_dict to W&B and reset it."""
         if self.wandb_run:
             with all_logging_disabled():
                 try:

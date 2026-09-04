@@ -12,7 +12,7 @@ Usage - formats:
                                        yolov5s-cls.onnx               # ONNX Runtime or OpenCV DNN with --dnn
                                        yolov5s-cls_openvino_model     # OpenVINO
                                        yolov5s-cls.engine             # TensorRT
-                                       yolov5s-cls.mlmodel            # CoreML (macOS-only)
+                                       yolov5s-cls.mlpackage          # CoreML (macOS-only)
                                        yolov5s-cls_saved_model        # TensorFlow SavedModel
                                        yolov5s-cls.pb                 # TensorFlow GraphDef
                                        yolov5s-cls.tflite             # TensorFlow Lite
@@ -26,7 +26,6 @@ import sys
 from pathlib import Path
 
 import torch
-from tqdm import tqdm
 
 FILE = Path(__file__).resolve()
 ROOT = FILE.parents[1]  # YOLOv5 root directory
@@ -38,7 +37,7 @@ from models.common import DetectMultiBackend
 from utils.dataloaders import create_classification_dataloader
 from utils.general import (
     LOGGER,
-    TQDM_BAR_FORMAT,
+    TQDM,
     Profile,
     check_img_size,
     check_requirements,
@@ -46,7 +45,7 @@ from utils.general import (
     increment_path,
     print_args,
 )
-from utils.torch_utils import select_device, smart_inference_mode
+from utils.torch_utils import select_device, smart_amp_autocast, smart_inference_mode
 
 
 @smart_inference_mode()
@@ -107,8 +106,8 @@ def run(
     n = len(dataloader)  # number of batches
     action = "validating" if dataloader.dataset.root.stem == "val" else "testing"
     desc = f"{pbar.desc[:-36]}{action:>36}" if pbar else f"{action}"
-    bar = tqdm(dataloader, desc, n, not training, bar_format=TQDM_BAR_FORMAT, position=0)
-    with torch.cuda.amp.autocast(enabled=device.type != "cpu"):
+    bar = TQDM(dataloader, desc, n, not training)
+    with smart_amp_autocast(device.type != "cpu"):
         for images, labels in bar:
             with dt[0]:
                 images, labels = images.to(device, non_blocking=True), labels.to(device)
@@ -142,7 +141,8 @@ def run(
         t = tuple(x.t / len(dataloader.dataset.samples) * 1e3 for x in dt)  # speeds per image
         shape = (1, 3, imgsz, imgsz)
         LOGGER.info(f"Speed: %.1fms pre-process, %.1fms inference, %.1fms post-process per image at shape {shape}" % t)
-        LOGGER.info(f"Results saved to {colorstr('bold', save_dir)}")
+        if not training:
+            LOGGER.info(f"Results saved to {colorstr('bold', save_dir)}")
 
     return top1, top5, loss
 
@@ -169,7 +169,7 @@ def parse_opt():
 
 def main(opt):
     """Executes the YOLOv5 model prediction workflow, handling argument parsing and requirement checks."""
-    check_requirements(ROOT / "requirements.txt", exclude=("tensorboard", "thop"))
+    check_requirements(ROOT / "requirements.txt", exclude=("tensorboard", "ultralytics-thop"))
     run(**vars(opt))
 
 

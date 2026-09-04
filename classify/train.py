@@ -19,16 +19,14 @@ import subprocess
 import sys
 import time
 from copy import deepcopy
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 
 import torch
 import torch.distributed as dist
-import torch.hub as hub
-import torch.optim.lr_scheduler as lr_scheduler
 import torchvision
-from torch.cuda import amp
-from tqdm import tqdm
+from torch import hub
+from torch.optim import lr_scheduler
 
 FILE = Path(__file__).resolve()
 ROOT = FILE.parents[1]  # YOLOv5 root directory
@@ -43,7 +41,7 @@ from utils.dataloaders import create_classification_dataloader
 from utils.general import (
     DATASETS_DIR,
     LOGGER,
-    TQDM_BAR_FORMAT,
+    TQDM,
     WorkingDirectory,
     check_git_info,
     check_git_status,
@@ -58,20 +56,22 @@ from utils.general import (
 from utils.loggers import GenericLogger
 from utils.plots import imshow_cls
 from utils.torch_utils import (
+    GradScaler,
     ModelEMA,
     de_parallel,
     model_info,
     reshape_classifier_output,
     select_device,
+    smart_amp_autocast,
     smart_DDP,
     smart_optimizer,
     smartCrossEntropyLoss,
     torch_distributed_zero_first,
 )
 
-LOCAL_RANK = int(os.getenv("LOCAL_RANK", -1))  # https://pytorch.org/docs/stable/elastic/run.html
-RANK = int(os.getenv("RANK", -1))
-WORLD_SIZE = int(os.getenv("WORLD_SIZE", 1))
+LOCAL_RANK = int(os.getenv("LOCAL_RANK", "-1"))  # https://pytorch.org/docs/stable/elastic/run.html
+RANK = int(os.getenv("RANK", "-1"))
+WORLD_SIZE = int(os.getenv("WORLD_SIZE", "1"))
 GIT_INFO = check_git_info()
 
 
@@ -107,10 +107,10 @@ def train(opt, device):
             LOGGER.info(f"\nDataset not found ⚠️, missing path {data_dir}, attempting download...")
             t = time.time()
             if str(data) == "imagenet":
-                subprocess.run(["bash", str(ROOT / "data/scripts/get_imagenet.sh")], shell=True, check=True)
+                subprocess.run(["bash", str(ROOT / "data/scripts/get_imagenet.sh")], check=True)
             else:
                 url = f"https://github.com/ultralytics/assets/releases/download/v0.0.0/{data}.zip"
-                download(url, dir=data_dir.parent)
+                download(url, dir=data_dir.parent, curl=True)
             s = f"Dataset download success ✅ ({time.time() - t:.1f}s), saved to {colorstr('bold', data_dir)}\n"
             LOGGER.info(s)
 
@@ -148,7 +148,7 @@ def train(opt, device):
             m = hub.list("ultralytics/yolov5")  # + hub.list('pytorch/vision')  # models
             raise ModuleNotFoundError(f"--model {opt.model} not found. Available models are: \n" + "\n".join(m))
         if isinstance(model, DetectionModel):
-            LOGGER.warning("WARNING ⚠️ pass YOLOv5 classifier model with '-cls' suffix, i.e. '--model yolov5s-cls.pt'")
+            LOGGER.warning("pass YOLOv5 classifier model with '-cls' suffix, i.e. '--model yolov5s-cls.pt'")
             model = ClassificationModel(model=model, nc=nc, cutoff=opt.cutoff or 10)  # convert to classification model
         reshape_classifier_output(model, nc)  # update class count
     for m in model.modules():
@@ -198,7 +198,8 @@ def train(opt, device):
     t0 = time.time()
     criterion = smartCrossEntropyLoss(label_smoothing=opt.label_smoothing)  # loss function
     best_fitness = 0.0
-    scaler = amp.GradScaler(enabled=cuda)
+    final_epoch = False  # defined here so the post-loop checkpoint block is safe when epochs == 0
+    scaler = GradScaler(enabled=cuda)
     val = test_dir.stem  # 'val' or 'test'
     LOGGER.info(
         f"Image sizes {imgsz} train, {imgsz} test\n"
@@ -214,12 +215,12 @@ def train(opt, device):
             trainloader.sampler.set_epoch(epoch)
         pbar = enumerate(trainloader)
         if RANK in {-1, 0}:
-            pbar = tqdm(enumerate(trainloader), total=len(trainloader), bar_format=TQDM_BAR_FORMAT)
+            pbar = TQDM(pbar, total=len(trainloader))
         for i, (images, labels) in pbar:  # progress bar
             images, labels = images.to(device, non_blocking=True), labels.to(device)
 
             # Forward
-            with amp.autocast(enabled=cuda):  # stability issues when enabled
+            with smart_amp_autocast(cuda):
                 loss = criterion(model(images), labels)
 
             # Backward
@@ -241,7 +242,7 @@ def train(opt, device):
                 pbar.desc = f"{f'{epoch + 1}/{epochs}':>10}{mem:>10}{tloss:>12.3g}" + " " * 36
 
                 # Test
-                if i == len(pbar) - 1:  # last batch
+                if i == len(trainloader) - 1:  # last batch
                     top1, top5, vloss = validate.run(
                         model=ema.ema, dataloader=testloader, criterion=criterion, pbar=pbar
                     )  # test accuracy, loss
@@ -253,8 +254,7 @@ def train(opt, device):
         # Log metrics
         if RANK in {-1, 0}:
             # Best fitness
-            if fitness > best_fitness:
-                best_fitness = fitness
+            best_fitness = max(best_fitness, fitness)
 
             # Log
             metrics = {
@@ -278,7 +278,7 @@ def train(opt, device):
                     "optimizer": None,  # optimizer.state_dict(),
                     "opt": vars(opt),
                     "git": GIT_INFO,  # {remote, branch, commit} if a git repo
-                    "date": datetime.now().isoformat(),
+                    "date": datetime.now().isoformat(),  # noqa: DTZ005
                 }
 
                 # Save last, best and delete
@@ -305,7 +305,7 @@ def train(opt, device):
         file = imshow_cls(images, labels, pred, de_parallel(model).names, verbose=False, f=save_dir / "test_images.jpg")
 
         # Log results
-        meta = {"epochs": epochs, "top1_acc": best_fitness, "date": datetime.now().isoformat()}
+        meta = {"epochs": epochs, "top1_acc": best_fitness, "date": datetime.now().isoformat()}  # noqa: DTZ005
         logger.log_images(file, name="Test Examples (true-predicted)", epoch=epoch)
         logger.log_model(best, epochs, metadata=meta)
 
@@ -350,12 +350,14 @@ def main(opt):
     # DDP mode
     device = select_device(opt.device, batch_size=opt.batch_size)
     if LOCAL_RANK != -1:
-        assert opt.batch_size != -1, "AutoBatch is coming soon for classification, please pass a valid --batch-size"
+        assert opt.batch_size != -1, "AutoBatch is not supported for classification, please pass a valid --batch-size"
         assert opt.batch_size % WORLD_SIZE == 0, f"--batch-size {opt.batch_size} must be multiple of WORLD_SIZE"
         assert torch.cuda.device_count() > LOCAL_RANK, "insufficient CUDA devices for DDP command"
         torch.cuda.set_device(LOCAL_RANK)
         device = torch.device("cuda", LOCAL_RANK)
-        dist.init_process_group(backend="nccl" if dist.is_nccl_available() else "gloo")
+        dist.init_process_group(
+            backend="nccl" if dist.is_nccl_available() else "gloo", timeout=timedelta(seconds=10800)
+        )
 
     # Parameters
     opt.save_dir = increment_path(Path(opt.project) / opt.name, exist_ok=opt.exist_ok)  # increment run
@@ -365,10 +367,9 @@ def main(opt):
 
 
 def run(**kwargs):
-    """
-    Executes YOLOv5 model training or inference with specified parameters, returning updated options.
+    """Executes YOLOv5 model training or inference with specified parameters, returning updated options.
 
-    Example: from yolov5 import classify; classify.train.run(data=mnist, imgsz=320, model='yolov5m')
+    Example: from yolov5 import classify; classify.train.run(data='mnist', imgsz=320, model='yolov5m-cls.pt')
     """
     opt = parse_opt(True)
     for k, v in kwargs.items():

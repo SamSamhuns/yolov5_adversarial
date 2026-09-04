@@ -1,4 +1,5 @@
 # Ultralytics 🚀 AGPL-3.0 License - https://ultralytics.com/license
+"""Segmentation plotting utils."""
 
 import contextlib
 import math
@@ -11,7 +12,7 @@ import pandas as pd
 import torch
 
 from .. import threaded
-from ..general import xywh2xyxy
+from ..general import LOGGER, xywh2xyxy
 from ..plots import Annotator, colors
 
 
@@ -52,7 +53,7 @@ def plot_images_and_masks(images, targets, masks, paths=None, fname="images.jpg"
     # Annotate
     fs = int((h + w) * ns * 0.01)  # font size
     annotator = Annotator(mosaic, line_width=round(fs / 10), font_size=fs, pil=True, example=names)
-    for i in range(i + 1):
+    for i in range(bs):
         x, y = int(w * (i // ns)), int(h * (i % ns))  # block origin
         annotator.rectangle([x, y, x + w, y + h], None, (255, 255, 255), width=2)  # borders
         if paths:
@@ -113,10 +114,9 @@ def plot_images_and_masks(images, targets, masks, paths=None, fname="images.jpg"
 
 
 def plot_results_with_masks(file="path/to/results.csv", dir="", best=True):
-    """
-    Plots training results from CSV files, plotting best or last result highlights based on `best` parameter.
+    """Plots training results from CSV files, plotting best or last result highlights based on `best` parameter.
 
-    Example: from utils.plots import *; plot_results('path/to/results.csv')
+    Example: from utils.segment.plots import *; plot_results_with_masks('path/to/results.csv')
     """
     save_dir = Path(file).parent if file else Path(dir)
     fig, ax = plt.subplots(2, 8, figsize=(18, 6), tight_layout=True)
@@ -143,10 +143,8 @@ def plot_results_with_masks(file="path/to/results.csv", dir="", best=True):
                     # last
                     ax[i].scatter(x[-1], y[-1], color="r", label="last", marker="*", linewidth=3)
                     ax[i].set_title(s[j] + f"\n{round(y[-1], 5)}")
-                # if j in [8, 9, 10]:  # share train and val loss y axes
-                #     ax[i].get_shared_y_axes().join(ax[i], ax[i - 5])
         except Exception as e:
-            print(f"Warning: Plotting error for {f}: {e}")
+            LOGGER.warning(f"Plotting error for {f}: {e}")
     ax[1].legend()
     fig.savefig(save_dir / "results.png", dpi=200)
     plt.close()

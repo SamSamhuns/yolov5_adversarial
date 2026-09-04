@@ -7,7 +7,9 @@ from ..metrics import ap_per_class
 
 
 def fitness(x):
-    """Evaluates model fitness by a weighted sum of 8 metrics, `x`: [N,8] array, weights: [0.1, 0.9] for mAP and F1."""
+    """Return model fitness as a weighted sum of box and mask metrics [P, R, mAP@0.5, mAP@0.5:0.95] with weights [0, 0,
+    0.1, 0.9] applied to each of the box and mask groups (x: [N, 8] array).
+    """
     w = [0.0, 0.0, 0.1, 0.9, 0.0, 0.0, 0.1, 0.9]
     return (x[:, :8] * w).sum(1)
 
@@ -22,11 +24,20 @@ def ap_per_class_box_and_mask(
     save_dir=".",
     names=(),
 ):
-    """
+    """Compute AP metrics for both boxes and masks given per-prediction true-positive arrays.
+
     Args:
-        tp_b: tp of boxes.
-        tp_m: tp of masks.
-        other arguments see `func: ap_per_class`.
+        tp_m (np.ndarray): True positives for masks, shape (n, 10).
+        tp_b (np.ndarray): True positives for boxes, shape (n, 10).
+        conf (np.ndarray): Objectness values from 0-1, shape (n,).
+        pred_cls (np.ndarray): Predicted object classes, shape (n,).
+        target_cls (np.ndarray): True object classes, shape (m,).
+        plot (bool): Plot precision-recall curves.
+        save_dir (str | Path): Plot save directory.
+        names (dict | tuple): Class index to name mapping used for plot legends.
+
+    Returns:
+        (dict): {'boxes': {'p', 'r', 'ap', 'f1', 'ap_class'}, 'masks': {...}} metric dicts from `ap_per_class`.
     """
     results_boxes = ap_per_class(
         tp_b, conf, pred_cls, target_cls, plot=plot, save_dir=save_dir, names=names, prefix="Box"
@@ -68,58 +79,54 @@ class Metric:
 
     @property
     def ap50(self):
-        """
-        AP@0.5 of all classes.
+        """AP@0.5 of all classes.
 
-        Return:
+        Returns:
             (nc, ) or [].
         """
         return self.all_ap[:, 0] if len(self.all_ap) else []
 
     @property
     def ap(self):
-        """AP@0.5:0.95
-        Return:
-            (nc, ) or [].
+        """AP@0.5:0.95.
+
+        Returns:
+            (nc, ) or []
         """
         return self.all_ap.mean(1) if len(self.all_ap) else []
 
     @property
     def mp(self):
-        """
-        Mean precision of all classes.
+        """Mean precision of all classes.
 
-        Return:
+        Returns:
             float.
         """
         return self.p.mean() if len(self.p) else 0.0
 
     @property
     def mr(self):
-        """
-        Mean recall of all classes.
+        """Mean recall of all classes.
 
-        Return:
+        Returns:
             float.
         """
         return self.r.mean() if len(self.r) else 0.0
 
     @property
     def map50(self):
-        """
-        Mean AP@0.5 of all classes.
+        """Mean AP@0.5 of all classes.
 
-        Return:
+        Returns:
             float.
         """
         return self.all_ap[:, 0].mean() if len(self.all_ap) else 0.0
 
     @property
     def map(self):
-        """
-        Mean AP@0.5:0.95 of all classes.
+        """Mean AP@0.5:0.95 of all classes.
 
-        Return:
+        Returns:
             float.
         """
         return self.all_ap.mean() if len(self.all_ap) else 0.0
@@ -140,9 +147,10 @@ class Metric:
         return maps
 
     def update(self, results):
-        """
+        """Update the metric attributes from new results.
+
         Args:
-            results: tuple(p, r, ap, f1, ap_class).
+            results (tuple): (p, r, ap, f1, ap_class).
         """
         p, r, all_ap, f1, ap_class_index = results
         self.p = p
@@ -156,16 +164,15 @@ class Metrics:
     """Metric for boxes and masks."""
 
     def __init__(self) -> None:
-        """Initializes Metric objects for bounding boxes and masks to compute performance metrics in the Metrics
-        class.
-        """
+        """Initialize Metric objects for bounding boxes and masks to compute performance metrics."""
         self.metric_box = Metric()
         self.metric_mask = Metric()
 
     def update(self, results):
-        """
+        """Update box and mask metrics from new results.
+
         Args:
-            results: Dict{'boxes': Dict{}, 'masks': Dict{}}.
+            results (dict): {'boxes': {...}, 'masks': {...}} metric dicts from `ap_per_class_box_and_mask`.
         """
         self.metric_box.update(list(results["boxes"].values()))
         self.metric_mask.update(list(results["masks"].values()))

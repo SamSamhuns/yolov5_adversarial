@@ -10,10 +10,9 @@ import cv2
 import numpy as np
 import torch
 import torchvision.transforms as T
-import torchvision.transforms.functional as TF
+from ultralytics.utils.metrics import bbox_ioa
 
-from utils.general import LOGGER, check_version, colorstr, resample_segments, segment2box, xywhn2xyxy
-from utils.metrics import bbox_ioa
+from utils.general import LOGGER, check_version, colorstr, resample_segments, segment2box
 
 IMAGENET_MEAN = 0.485, 0.456, 0.406  # RGB mean
 IMAGENET_STD = 0.229, 0.224, 0.225  # RGB standard deviation
@@ -30,16 +29,21 @@ class Albumentations:
             import albumentations as A
 
             check_version(A.__version__, "1.0.3", hard=True)  # version requirement
+            v2 = check_version(A.__version__, "2.0.0")  # Albumentations 2.x renamed several constructor arguments
 
             T = [
-                A.RandomResizedCrop(height=size, width=size, scale=(0.8, 1.0), ratio=(0.9, 1.11), p=0.0),
+                A.RandomResizedCrop(size=(size, size), scale=(0.8, 1.0), ratio=(0.9, 1.11), p=0.0)
+                if v2
+                else A.RandomResizedCrop(height=size, width=size, scale=(0.8, 1.0), ratio=(0.9, 1.11), p=0.0),
                 A.Blur(p=0.01),
                 A.MedianBlur(p=0.01),
                 A.ToGray(p=0.01),
                 A.CLAHE(p=0.01),
                 A.RandomBrightnessContrast(p=0.0),
                 A.RandomGamma(p=0.0),
-                A.ImageCompression(quality_lower=75, p=0.0),
+                A.ImageCompression(quality_range=(75, 100), p=0.0)
+                if v2
+                else A.ImageCompression(quality_lower=75, p=0.0),
             ]  # transforms
             self.transform = A.Compose(T, bbox_params=A.BboxParams(format="yolo", label_fields=["class_labels"]))
 
@@ -57,117 +61,8 @@ class Albumentations:
         return im, labels
 
 
-class BboxPatcher:
-    def __init__(
-        self,
-        patch_dir,
-        rotation_range=(-20, 20),
-        scale_range=(0.10, 0.30),
-        brightness_range=(0.9, 1.1),
-        contrast_range=(0.8, 1.2),
-        m_gau_mean=(0.7, 0.9),
-        m_gau_std=(0.1, 0.1),
-        patch_apply_prob=0.5,
-    ):
-        """
-        patch_dir: dir with patches
-        rotation_range: rotation range in degrees
-        scale_range: scale range in float
-        """
-        self.patches = []
-        for patch_path in glob.glob(os.path.join(patch_dir, "*")):
-            if os.path.splitext(patch_path)[1].lower() in {".jpeg", ".jpg", ".png"}:
-                patch = cv2.imread(patch_path)
-                self.patches.append(TF.to_tensor(patch))
-        self.rotation_range = rotation_range
-        self.scale_range = scale_range
-        self.brightness_range = brightness_range
-        self.contrast_range = contrast_range
-        self.noise_factor = 0.01
-        self.m_gau_mean = m_gau_mean
-        self.m_gau_std = m_gau_std
-        self.patch_apply_prob = patch_apply_prob
-
-    def __call__(self, image: np.ndarray, bbox_coords: np.ndarray):
-        """
-        Arguments:
-            image: np.ndarray, image of shape H,W,C
-            bbox_coords: np.ndarray, [[cls,x1,y1,x2,y2], ...]
-        """
-        img_h, img_w = image.shape[:2]
-        image = TF.to_tensor(image)
-
-        for bbox in bbox_coords:
-            if np.random.random() < self.patch_apply_prob:
-                continue
-            patch = self.patches[np.random.randint(0, len(self.patches))]
-            # add and mul with gaussian noise
-            pc, ph, pw = patch.shape
-            mul_gau = torch.normal(
-                np.random.uniform(*self.m_gau_mean), np.random.uniform(*self.m_gau_std), (pc, ph, pw)
-            )
-            add_gau = torch.normal(0, 0.001, (pc, ph, pw))
-            patch = patch * mul_gau + add_gau
-
-            # adjust brightness, contrast & add uniform noise
-            patch = TF.adjust_brightness(patch, np.random.uniform(*self.brightness_range))
-            patch = TF.adjust_contrast(patch, np.random.uniform(*self.contrast_range))
-            patch += torch.FloatTensor(patch.size()).uniform_(-1, 1) * self.noise_factor
-
-            # Randomly select rotation and scale parameters
-            rotation = np.random.uniform(*self.rotation_range)
-            scale = np.random.uniform(*self.scale_range)
-
-            _, x1, y1, x2, y2 = map(int, bbox)
-            # Calculate the width and height of the bounding box
-            bbox_width = x2 - x1
-            bbox_height = y2 - y1
-
-            # Calculate the width and height of the patch after scaling
-            psize = max(int((bbox_width * bbox_height * scale) ** (1 / 2)), 1)
-            # patch is square
-            patch_scaled_w = psize
-            patch_scaled_h = psize
-
-            # resize patch
-            patch = TF.resize(patch, (patch_scaled_h, patch_scaled_w), antialias=True)
-
-            # create patch mask
-            patch_mask = torch.ones_like(patch)
-
-            # rotate patch and its mask
-            patch = TF.rotate(patch, rotation, expand=True, fill=0)
-            patch_mask = TF.rotate(patch_mask, rotation, expand=True, fill=0)
-            patch_scaled_h, patch_scaled_w = patch.shape[1:]  # expanded rotation changes size
-
-            # Calculate the position to place the patch at the center of the bbox
-            x_pos = int(x1 + (bbox_width - patch_scaled_w) / 2)
-            y_pos = int(y1 + (bbox_height - patch_scaled_h) / 2)
-            # pad patch and its mask
-            padded_patch = TF.pad(
-                patch, (x_pos, y_pos, img_w - (x_pos + patch_scaled_w), img_h - (y_pos + patch_scaled_h))
-            )
-            padded_patch_mask = TF.pad(
-                patch_mask, (x_pos, y_pos, img_w - (x_pos + patch_scaled_w), img_h - (y_pos + patch_scaled_h))
-            )
-
-            # Apply the patch to the image
-            image = image * (1 - padded_patch_mask) + padded_patch * padded_patch_mask
-
-        return np.asarray(T.ToPILImage()(image))
-
-
-def normalize(x, mean=IMAGENET_MEAN, std=IMAGENET_STD, inplace=False):
-    """
-    Applies ImageNet normalization to RGB images in BCHW format, modifying them in-place if specified.
-
-    Example: y = (x - mean) / std
-    """
-    return TF.normalize(x, mean, std, inplace=inplace)
-
-
 def denormalize(x, mean=IMAGENET_MEAN, std=IMAGENET_STD):
-    """Reverses ImageNet normalization for BCHW format RGB images by applying `x = x * std + mean`."""
+    """Reverses ImageNet normalization for BCHW format RGB images by applying `x = x * std + mean` (in place)."""
     for i in range(3):
         x[:, i] = x[:, i] * std[i] + mean[i]
     return x
@@ -187,38 +82,6 @@ def augment_hsv(im, hgain=0.5, sgain=0.5, vgain=0.5):
 
         im_hsv = cv2.merge((cv2.LUT(hue, lut_hue), cv2.LUT(sat, lut_sat), cv2.LUT(val, lut_val)))
         cv2.cvtColor(im_hsv, cv2.COLOR_HSV2BGR, dst=im)  # no return needed
-
-
-def hist_equalize(im, clahe=True, bgr=False):
-    """Equalizes image histogram, with optional CLAHE, for BGR or RGB image with shape (n,m,3) and range 0-255."""
-    yuv = cv2.cvtColor(im, cv2.COLOR_BGR2YUV if bgr else cv2.COLOR_RGB2YUV)
-    if clahe:
-        c = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
-        yuv[:, :, 0] = c.apply(yuv[:, :, 0])
-    else:
-        yuv[:, :, 0] = cv2.equalizeHist(yuv[:, :, 0])  # equalize Y channel histogram
-    return cv2.cvtColor(yuv, cv2.COLOR_YUV2BGR if bgr else cv2.COLOR_YUV2RGB)  # convert YUV image to RGB
-
-
-def replicate(im, labels):
-    """
-    Replicates half of the smallest object labels in an image for data augmentation.
-
-    Returns augmented image and labels.
-    """
-    h, w = im.shape[:2]
-    boxes = labels[:, 1:].astype(int)
-    x1, y1, x2, y2 = boxes.T
-    s = ((x2 - x1) + (y2 - y1)) / 2  # side length (pixels)
-    for i in s.argsort()[: round(s.size * 0.5)]:  # smallest indices
-        x1b, y1b, x2b, y2b = boxes[i]
-        bh, bw = y2b - y1b, x2b - x1b
-        yc, xc = int(random.uniform(0, h - bh)), int(random.uniform(0, w - bw))  # offset x, y
-        x1a, y1a, x2a, y2a = [xc, yc, xc + bw, yc + bh]
-        im[y1a:y2a, x1a:x2a] = im[y1b:y2b, x1b:x2b]  # im4[ymin:ymax, xmin:xmax]
-        labels = np.append(labels, [[labels[i, 0], x1a, y1a, x2a, y2a]], axis=0)
-
-    return im, labels
 
 
 def letterbox(im, new_shape=(640, 640), color=(114, 114, 114), auto=True, scaleFill=False, scaleup=True, stride=32):
@@ -337,8 +200,7 @@ def random_perspective(
 
 
 def copy_paste(im, labels, segments, p=0.5):
-    """
-    Applies Copy-Paste augmentation by flipping and merging segments and labels on an image.
+    """Applies Copy-Paste augmentation by flipping and merging segments and labels on an image.
 
     Details at https://arxiv.org/abs/2012.07177.
     """
@@ -347,12 +209,12 @@ def copy_paste(im, labels, segments, p=0.5):
         _h, w, _c = im.shape  # height, width, channels
         im_new = np.zeros(im.shape, np.uint8)
         for j in random.sample(range(n), k=round(p * n)):
-            l, s = labels[j], segments[j]
-            box = w - l[3], l[2], w - l[1], l[4]
-            ioa = bbox_ioa(box, labels[:, 1:5])  # intersection over area
+            label, segment = labels[j], segments[j]
+            box = w - label[3], label[2], w - label[1], label[4]
+            ioa = bbox_ioa(np.array(box)[None], labels[:, 1:5])  # intersection over area
             if (ioa < 0.30).all():  # allow 30% obscuration of existing labels
-                labels = np.concatenate((labels, [[l[0], *box]]), 0)
-                segments.append(np.concatenate((w - s[:, 0:1], s[:, 1:2]), 1))
+                labels = np.concatenate((labels, [[label[0], *box]]), 0)
+                segments.append(np.concatenate((w - segment[:, 0:1], segment[:, 1:2]), 1))
                 cv2.drawContours(im_new, [segments[j].astype(np.int32)], -1, (1, 1, 1), cv2.FILLED)
 
         result = cv2.flip(im, 1)  # augment segments (flip left-right)
@@ -362,40 +224,8 @@ def copy_paste(im, labels, segments, p=0.5):
     return im, labels, segments
 
 
-def cutout(im, labels, p=0.5):
-    """
-    Applies cutout augmentation to an image with optional label adjustment, using random masks of varying sizes.
-
-    Details at https://arxiv.org/abs/1708.04552.
-    """
-    if random.random() < p:
-        h, w = im.shape[:2]
-        scales = [0.5] * 1 + [0.25] * 2 + [0.125] * 4 + [0.0625] * 8 + [0.03125] * 16  # image size fraction
-        for s in scales:
-            mask_h = random.randint(1, int(h * s))  # create random masks
-            mask_w = random.randint(1, int(w * s))
-
-            # box
-            xmin = max(0, random.randint(0, w) - mask_w // 2)
-            ymin = max(0, random.randint(0, h) - mask_h // 2)
-            xmax = min(w, xmin + mask_w)
-            ymax = min(h, ymin + mask_h)
-
-            # apply random color mask
-            im[ymin:ymax, xmin:xmax] = [random.randint(64, 191) for _ in range(3)]
-
-            # return unobscured labels
-            if len(labels) and s > 0.03:
-                box = np.array([xmin, ymin, xmax, ymax], dtype=np.float32)
-                ioa = bbox_ioa(box, xywhn2xyxy(labels[:, 1:5], w, h))  # intersection over area
-                labels = labels[ioa < 0.60]  # remove >60% obscured labels
-
-    return labels
-
-
 def mixup(im, labels, im2, labels2):
-    """
-    Applies MixUp augmentation by blending images and labels.
+    """Applies MixUp augmentation by blending images and labels.
 
     See https://arxiv.org/pdf/1710.09412.pdf for details.
     """
@@ -406,8 +236,7 @@ def mixup(im, labels, im2, labels2):
 
 
 def box_candidates(box1, box2, wh_thr=2, ar_thr=100, area_thr=0.1, eps=1e-16):
-    """
-    Filters bounding box candidates by minimum width-height threshold `wh_thr` (pixels), aspect ratio threshold
+    """Filters bounding box candidates by minimum width-height threshold `wh_thr` (pixels), aspect ratio threshold
     `ar_thr`, and area ratio threshold `area_thr`.
 
     box1(4,n) is before augmentation, box2(4,n) is after augmentation.
@@ -431,9 +260,7 @@ def classify_albumentations(
     auto_aug=False,
 ):
     # YOLOv5 classification Albumentations (optional, only used if package is installed)
-    """Sets up and returns Albumentations transforms for YOLOv5 classification tasks depending on augmentation
-    settings.
-    """
+    """Sets up Albumentations transforms for YOLOv5 classification tasks depending on augmentation settings."""
     prefix = colorstr("albumentations: ")
     try:
         import albumentations as A
@@ -441,7 +268,11 @@ def classify_albumentations(
 
         check_version(A.__version__, "1.0.3", hard=True)  # version requirement
         if augment:  # Resize and crop
-            T = [A.RandomResizedCrop(height=size, width=size, scale=scale, ratio=ratio)]
+            T = [
+                A.RandomResizedCrop(size=(size, size), scale=scale, ratio=ratio)
+                if check_version(A.__version__, "2.0.0")
+                else A.RandomResizedCrop(height=size, width=size, scale=scale, ratio=ratio)
+            ]
             if auto_aug:
                 # TODO: implement AugMix, AutoAug & RandAug in albumentation
                 LOGGER.info(f"{prefix}auto augmentations are currently not supported")
@@ -460,7 +291,7 @@ def classify_albumentations(
         return A.Compose(T)
 
     except ImportError:  # package not installed, skip
-        LOGGER.warning(f"{prefix}⚠️ not found, install with `pip install albumentations` (recommended)")
+        LOGGER.warning(f"{prefix}not found, install with `pip install albumentations` (recommended)")
     except Exception as e:
         LOGGER.info(f"{prefix}{e}")
 
@@ -472,34 +303,6 @@ def classify_transforms(size=224):
     return T.Compose([CenterCrop(size), ToTensor(), T.Normalize(IMAGENET_MEAN, IMAGENET_STD)])
 
 
-class LetterBox:
-    """Resizes and pads images to specified dimensions while maintaining aspect ratio for YOLOv5 preprocessing."""
-
-    def __init__(self, size=(640, 640), auto=False, stride=32):
-        """Initializes a LetterBox object for YOLOv5 image preprocessing with optional auto sizing and stride
-        adjustment.
-        """
-        super().__init__()
-        self.h, self.w = (size, size) if isinstance(size, int) else size
-        self.auto = auto  # pass max size integer, automatically solve for short side using stride
-        self.stride = stride  # used with auto
-
-    def __call__(self, im):
-        """
-        Resizes and pads input image `im` (HWC format) to specified dimensions, maintaining aspect ratio.
-
-        im = np.array HWC
-        """
-        imh, imw = im.shape[:2]
-        r = min(self.h / imh, self.w / imw)  # ratio of new/old
-        h, w = round(imh * r), round(imw * r)  # resized image
-        hs, ws = (math.ceil(x / self.stride) * self.stride for x in (h, w)) if self.auto else self.h, self.w
-        top, left = round((hs - h) / 2 - 0.1), round((ws - w) / 2 - 0.1)
-        im_out = np.full((self.h, self.w, 3), 114, dtype=im.dtype)
-        im_out[top : top + h, left : left + w] = cv2.resize(im, (w, h), interpolation=cv2.INTER_LINEAR)
-        return im_out
-
-
 class CenterCrop:
     """Applies center crop to an image, resizing it to the specified size while maintaining aspect ratio."""
 
@@ -509,8 +312,7 @@ class CenterCrop:
         self.h, self.w = (size, size) if isinstance(size, int) else size
 
     def __call__(self, im):
-        """
-        Applies center crop to the input image and resizes it to a specified size, maintaining aspect ratio.
+        """Applies center crop to the input image and resizes it to a specified size, maintaining aspect ratio.
 
         im = np.array HWC
         """
@@ -529,8 +331,7 @@ class ToTensor:
         self.half = half
 
     def __call__(self, im):
-        """
-        Converts BGR np.array image from HWC to RGB CHW format, and normalizes to [0, 1], with support for FP16 if
+        """Converts BGR np.array image from HWC to RGB CHW format, and normalizes to [0, 1], with support for FP16 if
         `half=True`.
 
         im = np.array HWC in BGR order

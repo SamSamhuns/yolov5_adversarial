@@ -3,15 +3,26 @@
 
 import argparse
 import io
+import os
+import secrets
 
-import torch
 from flask import Flask, request
 from PIL import Image
-
-app = Flask(__name__)
-models = {}
+from werkzeug.exceptions import RequestEntityTooLarge
 
 DETECTION_URL = "/v1/object-detection/<model>"
+ALLOWED_EXTENSIONS = {"jpg", "jpeg", "png", "gif", "bmp", "tiff", "webp"}
+MAX_IMAGE_SIZE = 16 * 1024 * 1024  # 16 MB
+
+app = Flask(__name__)
+app.config["MAX_CONTENT_LENGTH"] = MAX_IMAGE_SIZE
+models = {}
+
+
+@app.errorhandler(RequestEntityTooLarge)
+def handle_large_upload(_):
+    """Return a JSON error for uploads rejected by Flask before request parsing."""
+    return {"error": "File too large. Maximum size is 16 MB."}, 413
 
 
 @app.route(DETECTION_URL, methods=["POST"])
@@ -19,25 +30,41 @@ def predict(model):
     """Predict and return object detections in JSON format given an image and model name via a Flask REST API POST
     request.
     """
-    if request.method != "POST":
-        return
+    if (api_key := os.getenv("API_KEY")) and not secrets.compare_digest(
+        request.headers.get("X-API-Key", "").encode(), api_key.encode()
+    ):
+        return {"error": "Unauthorized"}, 401
+    if not request.files.get("image"):
+        return {"error": "No image file provided"}, 400
+    im_file = request.files["image"]
 
-    if request.files.get("image"):
-        # Method 1
-        # with request.files["image"] as f:
-        #     im = Image.open(io.BytesIO(f.read()))
+    # Validate file extension against allowlist
+    filename = im_file.filename or ""
+    ext = filename.rsplit(".", 1)[-1].lower() if "." in filename else ""
+    if ext not in ALLOWED_EXTENSIONS:
+        return {"error": "Invalid file type. Allowed types: " + ", ".join(sorted(ALLOWED_EXTENSIONS))}, 400
 
-        # Method 2
-        im_file = request.files["image"]
-        im_bytes = im_file.read()
-        im = Image.open(io.BytesIO(im_bytes))
+    # Enforce upload size limit
+    im_bytes = im_file.read(MAX_IMAGE_SIZE + 1)
+    if len(im_bytes) > MAX_IMAGE_SIZE:
+        return {"error": "File too large. Maximum size is 16 MB."}, 413
 
-        if model in models:
-            results = models[model](im, size=640)  # reduce size=320 for faster inference
-            return results.pandas().xyxy[0].to_json(orient="records")
+    try:
+        with Image.open(io.BytesIO(im_bytes)) as im:
+            im.verify()
+    except Exception:
+        return {"error": "Invalid image file"}, 400
+    im = Image.open(io.BytesIO(im_bytes))
+
+    if model not in models:
+        return {"error": "Model not found. Available models: " + ", ".join(sorted(models))}, 404
+    results = models[model](im, size=640)  # reduce size=320 for faster inference
+    return results.pandas().xyxy[0].to_json(orient="records")
 
 
 if __name__ == "__main__":
+    import torch
+
     parser = argparse.ArgumentParser(description="Flask API exposing YOLOv5 model")
     parser.add_argument("--port", default=5000, type=int, help="port number")
     parser.add_argument("--model", nargs="+", default=["yolov5s"], help="model(s) to run, i.e. --model yolov5n yolov5s")
@@ -46,4 +73,4 @@ if __name__ == "__main__":
     for m in opt.model:
         models[m] = torch.hub.load("ultralytics/yolov5", m, force_reload=True, skip_validation=True)
 
-    app.run(host="0.0.0.0", port=opt.port)  # debug=True causes Restarting with stat
+    app.run(host="127.0.0.1", port=opt.port)  # debug=True causes Restarting with stat

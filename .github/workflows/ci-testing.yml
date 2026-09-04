@@ -26,14 +26,14 @@ jobs:
         python-version: ["3.11"] # requires python<=3.11
         model: [yolov5n]
     steps:
-      - uses: actions/checkout@v5
-      - uses: actions/setup-python@v6
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
         with:
           python-version: ${{ matrix.python-version }}
-      - uses: astral-sh/setup-uv@v7
+      - uses: ultralytics/actions/setup-uv@main
       - name: Install requirements
         run: |
-          uv pip install --system -r requirements.txt coremltools openvino-dev "tensorflow<=2.19.0" --extra-index-url https://download.pytorch.org/whl/cpu --index-strategy unsafe-best-match
+          uv pip install --system -r requirements.txt coremltools "openvino>=2024.0.0" "tensorflow<=2.19.0" "keras>=3.5.0,<=3.12.0" --extra-index-url https://download.pytorch.org/whl/cpu --index-strategy unsafe-best-match
           yolo checks
           uv pip list
       - name: Benchmark DetectionModel
@@ -56,19 +56,19 @@ jobs:
       fail-fast: false
       matrix:
         os: [ubuntu-latest, windows-latest, macos-14] # macos-latest bug https://github.com/ultralytics/yolov5/pull/9049
-        python-version: ["3.11"]
+        python-version: ["3.x"] # evergreen latest stable Python
         model: [yolov5n]
         include:
           - os: ubuntu-latest
-            python-version: "3.8" # torch 1.8.0 requires python >=3.6, <=3.8
+            python-version: "3.8" # repo minimum Python, paired with minimum torch 1.8.0
             model: yolov5n
             torch: "1.8.0" # min torch version CI https://pypi.org/project/torchvision/
     steps:
-      - uses: actions/checkout@v5
-      - uses: actions/setup-python@v6
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
         with:
           python-version: ${{ matrix.python-version }}
-      - uses: astral-sh/setup-uv@v7
+      - uses: ultralytics/actions/setup-uv@main
       - name: Install requirements
         run: |
           torch=""
@@ -77,6 +77,11 @@ jobs:
           fi
           uv pip install --system -r requirements.txt $torch --extra-index-url https://download.pytorch.org/whl/cpu --index-strategy unsafe-best-match
         shell: bash # for Windows compatibility
+      - name: Update macOS security policy
+        if: runner.os == 'macOS'
+        run: | # fix occasional torch multiprocessing failure
+          xattr -dr com.apple.quarantine "$(python -c "import torch; import os; print(os.path.dirname(torch.__file__))")"
+          chmod +x "$(python -c "import torch; print(torch.__file__.replace('__init__.py', 'bin/torch_shm_manager'))")"
       - name: Check environment
         run: |
           yolo checks
@@ -90,8 +95,8 @@ jobs:
           python train.py --imgsz 64 --batch 32 --weights $m.pt --cfg $m.yaml --epochs 1 --device cpu  # train
           for d in cpu; do  # devices
             for w in $m $b; do  # weights
-              python val.py --imgsz 64 --batch 32 --weights $w.pt --device $d  # val
-              python detect.py --imgsz 64 --weights $w.pt --device $d  # detect
+              python val.py --imgsz 64 --batch 32 --weights "$w.pt" --device $d  # val
+              python detect.py --imgsz 64 --weights "$w.pt" --device $d  # detect
             done
           done
           python hubconf.py --model $m  # hub
@@ -116,9 +121,9 @@ jobs:
           python segment/train.py --imgsz 64 --batch 32 --weights '' --cfg $m.yaml --epochs 1 --device cpu  # train
           for d in cpu; do  # devices
             for w in $m $b; do  # weights
-              python segment/val.py --imgsz 64 --batch 32 --weights $w.pt --device $d  # val
-              python segment/predict.py --imgsz 64 --weights $w.pt --device $d  # predict
-              python export.py --weights $w.pt --img 64 --include torchscript --device $d  # export
+              python segment/val.py --imgsz 64 --batch 32 --weights "$w.pt" --device $d  # val
+              python segment/predict.py --imgsz 64 --weights "$w.pt" --device $d  # predict
+              python export.py --weights "$w.pt" --img 64 --include torchscript --device $d  # export
             done
           done
       - name: Test classification
@@ -144,9 +149,9 @@ jobs:
     steps:
       - name: Check for failure and notify
         if: (needs.Benchmarks.result == 'failure' || needs.Tests.result == 'failure' || needs.Benchmarks.result == 'cancelled' || needs.Tests.result == 'cancelled') && github.repository == 'ultralytics/yolov5' && (github.event_name == 'schedule' || github.event_name == 'push') && github.run_attempt == '1'
-        uses: slackapi/slack-github-action@v2.1.1
+        uses: slackapi/slack-github-action@v4.0.0
         with:
           webhook-type: incoming-webhook
           webhook: ${{ secrets.SLACK_WEBHOOK_URL_YOLO }}
           payload: |
-            text: "<!channel> GitHub Actions error for ${{ github.workflow }} ❌\n\n\n*Repository:* https://github.com/${{ github.repository }}\n*Action:* https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}\n*Author:* ${{ github.actor }}\n*Event:* ${{ github.event_name }}\n"
+            text: "<!subteam^S082BPCRAJ3> *${{ github.workflow }}* ❌ `${{ github.repository }}`  <https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}|*Run*>"

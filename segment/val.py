@@ -10,9 +10,9 @@ Usage - formats:
     $ python segment/val.py --weights yolov5s-seg.pt                 # PyTorch
                                       yolov5s-seg.torchscript        # TorchScript
                                       yolov5s-seg.onnx               # ONNX Runtime or OpenCV DNN with --dnn
-                                      yolov5s-seg_openvino_label     # OpenVINO
+                                      yolov5s-seg_openvino_model     # OpenVINO
                                       yolov5s-seg.engine             # TensorRT
-                                      yolov5s-seg.mlmodel            # CoreML (macOS-only)
+                                      yolov5s-seg.mlpackage          # CoreML (macOS-only)
                                       yolov5s-seg_saved_model        # TensorFlow SavedModel
                                       yolov5s-seg.pb                 # TensorFlow GraphDef
                                       yolov5s-seg.tflite             # TensorFlow Lite
@@ -21,6 +21,7 @@ Usage - formats:
 """
 
 import argparse
+import glob
 import json
 import os
 import subprocess
@@ -30,7 +31,6 @@ from pathlib import Path
 
 import numpy as np
 import torch
-from tqdm import tqdm
 
 FILE = Path(__file__).resolve()
 ROOT = FILE.parents[1]  # YOLOv5 root directory
@@ -38,15 +38,13 @@ if str(ROOT) not in sys.path:
     sys.path.append(str(ROOT))  # add ROOT to PATH
 ROOT = Path(os.path.relpath(ROOT, Path.cwd()))  # relative
 
-import torch.nn.functional as F
 
 from models.common import DetectMultiBackend
 from models.yolo import SegmentationModel
-from utils.callbacks import Callbacks
 from utils.general import (
     LOGGER,
     NUM_THREADS,
-    TQDM_BAR_FORMAT,
+    TQDM,
     Profile,
     check_dataset,
     check_img_size,
@@ -57,34 +55,22 @@ from utils.general import (
     increment_path,
     non_max_suppression,
     print_args,
+    save_one_txt,
     scale_boxes,
     xywh2xyxy,
     xyxy2xywh,
 )
-from utils.metrics import ConfusionMatrix, box_iou
+from utils.metrics import ConfusionMatrix, process_batch
 from utils.plots import output_to_target, plot_val_study
 from utils.segment.dataloaders import create_dataloader
-from utils.segment.general import mask_iou, process_mask, process_mask_native, scale_image
+from utils.segment.general import process_mask, process_mask_native, scale_image
 from utils.segment.metrics import Metrics, ap_per_class_box_and_mask
 from utils.segment.plots import plot_images_and_masks
 from utils.torch_utils import de_parallel, select_device, smart_inference_mode
 
 
-def save_one_txt(predn, save_conf, shape, file):
-    """Saves detection results in txt format; includes class, xywh (normalized), optionally confidence if `save_conf` is
-    True.
-    """
-    gn = torch.tensor(shape)[[1, 0, 1, 0]]  # normalization gain whwh
-    for *xyxy, conf, cls in predn.tolist():
-        xywh = (xyxy2xywh(torch.tensor(xyxy).view(1, 4)) / gn).view(-1).tolist()  # normalized xywh
-        line = (cls, *xywh, conf) if save_conf else (cls, *xywh)  # label format
-        with open(file, "a") as f:
-            f.write(("%g " * len(line)).rstrip() % line + "\n")
-
-
 def save_one_json(predn, jdict, path, class_map, pred_masks):
-    """
-    Saves a JSON file with detection results including bounding boxes, category IDs, scores, and segmentation masks.
+    """Saves a JSON file with detection results including bounding boxes, category IDs, scores, and segmentation masks.
 
     Example JSON result: {"image_id": 42, "category_id": 18, "bbox": [258.15, 41.29, 348.26, 243.78], "score": 0.236}.
     """
@@ -112,43 +98,6 @@ def save_one_json(predn, jdict, path, class_map, pred_masks):
                 "segmentation": rles[i],
             }
         )
-
-
-def process_batch(detections, labels, iouv, pred_masks=None, gt_masks=None, overlap=False, masks=False):
-    """
-    Return correct prediction matrix
-    Arguments:
-        detections (array[N, 6]), x1, y1, x2, y2, conf, class
-        labels (array[M, 5]), class, x1, y1, x2, y2
-    Returns:
-        correct (array[N, 10]), for 10 IoU levels.
-    """
-    if masks:
-        if overlap:
-            nl = len(labels)
-            index = torch.arange(nl, device=gt_masks.device).view(nl, 1, 1) + 1
-            gt_masks = gt_masks.repeat(nl, 1, 1)  # shape(1,640,640) -> (n,640,640)
-            gt_masks = torch.where(gt_masks == index, 1.0, 0.0)
-        if gt_masks.shape[1:] != pred_masks.shape[1:]:
-            gt_masks = F.interpolate(gt_masks[None], pred_masks.shape[1:], mode="bilinear", align_corners=False)[0]
-            gt_masks = gt_masks.gt_(0.5)
-        iou = mask_iou(gt_masks.view(gt_masks.shape[0], -1), pred_masks.view(pred_masks.shape[0], -1))
-    else:  # boxes
-        iou = box_iou(labels[:, 1:], detections[:, :4])
-
-    correct = np.zeros((detections.shape[0], iouv.shape[0])).astype(bool)
-    correct_class = labels[:, 0:1] == detections[:, 5]
-    for i in range(len(iouv)):
-        x = torch.where((iou >= iouv[i]) & correct_class)  # IoU > threshold and classes match
-        if x[0].shape[0]:
-            matches = torch.cat((torch.stack(x, 1), iou[x[0], x[1]][:, None]), 1).cpu().numpy()  # [label, detect, iou]
-            if x[0].shape[0] > 1:
-                matches = matches[matches[:, 2].argsort()[::-1]]
-                matches = matches[np.unique(matches[:, 1], return_index=True)[1]]
-                # matches = matches[matches[:, 2].argsort()[::-1]]
-                matches = matches[np.unique(matches[:, 0], return_index=True)[1]]
-            correct[matches[:, 1].astype(int), i] = True
-    return torch.tensor(correct, dtype=torch.bool, device=iouv.device)
 
 
 @smart_inference_mode()
@@ -182,11 +131,8 @@ def run(
     overlap=False,
     mask_downsample_ratio=1,
     compute_loss=None,
-    callbacks=Callbacks(),
 ):
-    """Validates a YOLOv5 segmentation model on specified dataset, producing metrics, plots, and optional JSON
-    output.
-    """
+    """Validate a YOLOv5 segmentation model on specified dataset, producing metrics, plots, and optional JSON output."""
     if save_json:
         check_requirements("pycocotools>=2.0.6")
         process = process_mask_native  # more accurate
@@ -212,7 +158,11 @@ def run(
         stride, pt, jit, engine = model.stride, model.pt, model.jit, model.engine
         imgsz = check_img_size(imgsz, s=stride)  # check image size
         half = model.fp16  # FP16 supported on limited backends with CUDA
-        nm = de_parallel(model).model.model[-1].nm if isinstance(model, SegmentationModel) else 32  # number of masks
+        nm = (
+            de_parallel(model.model).model[-1].nm
+            if isinstance(getattr(model, "model", None), SegmentationModel)
+            else 32
+        )  # number of masks
         if engine:
             batch_size = model.batch_size
         else:
@@ -280,10 +230,8 @@ def run(
     metrics = Metrics()
     loss = torch.zeros(4, device=device)
     jdict, stats = [], []
-    # callbacks.run('on_val_start')
-    pbar = tqdm(dataloader, desc=s, bar_format=TQDM_BAR_FORMAT)  # progress bar
+    pbar = TQDM(dataloader, desc=s)  # progress bar
     for batch_i, (im, targets, paths, shapes, masks) in enumerate(pbar):
-        # callbacks.run('on_val_batch_start')
         with dt[0]:
             if cuda:
                 im = im.to(device, non_blocking=True)
@@ -355,13 +303,12 @@ def run(
 
             # Save/log
             if save_txt:
-                save_one_txt(predn, save_conf, shape, file=save_dir / "labels" / f"{path.stem}.txt")
+                save_one_txt(predn[:, :6], save_conf, shape, file=save_dir / "labels" / f"{path.stem}.txt")
             if save_json:
                 pred_masks = scale_image(
                     im[si].shape[1:], pred_masks.permute(1, 2, 0).contiguous().cpu().numpy(), shape, shapes[si][1]
                 )
                 save_one_json(predn, jdict, path, class_map, pred_masks)  # append to COCO-JSON dictionary
-            # callbacks.run('on_val_image_end', pred, predn, path, names, im[si])
 
         # Plot images
         if plots and batch_i < 3:
@@ -377,8 +324,6 @@ def run(
                 names,
             )  # pred
 
-        # callbacks.run('on_val_batch_end')
-
     # Compute metrics
     stats = [torch.cat(x, 0).cpu().numpy() for x in zip(*stats)]  # to numpy
     if len(stats) and stats[0].any():
@@ -390,7 +335,7 @@ def run(
     pf = "%22s" + "%11i" * 2 + "%11.3g" * 8  # print format
     LOGGER.info(pf % ("all", seen, nt.sum(), *metrics.mean_results()))
     if nt.sum() == 0:
-        LOGGER.warning(f"WARNING ⚠️ no labels found in {task} set, can not compute metrics without labels")
+        LOGGER.warning(f"no labels found in {task} set, can not compute metrics without labels")
 
     # Print results per class
     if (verbose or (nc < 50 and not training)) and nc > 1 and len(stats):
@@ -406,7 +351,6 @@ def run(
     # Plots
     if plots:
         confusion_matrix.plot(save_dir=save_dir, names=list(names.values()))
-    # callbacks.run('on_val_end')
 
     mp_bbox, mr_bbox, map50_bbox, map_bbox, mp_mask, mr_mask, map50_mask, map_mask = metrics.mean_results()
 
@@ -483,13 +427,13 @@ def parse_opt():
 
 def main(opt):
     """Executes YOLOv5 tasks including training, validation, testing, speed, and study with configurable options."""
-    check_requirements(ROOT / "requirements.txt", exclude=("tensorboard", "thop"))
+    check_requirements(ROOT / "requirements.txt", exclude=("tensorboard", "ultralytics-thop"))
 
     if opt.task in ("train", "val", "test"):  # run normally
         if opt.conf_thres > 0.001:  # https://github.com/ultralytics/yolov5/issues/1466
-            LOGGER.warning(f"WARNING ⚠️ confidence threshold {opt.conf_thres} > 0.001 produces invalid results")
+            LOGGER.warning(f"confidence threshold {opt.conf_thres} > 0.001 produces invalid results")
         if opt.save_hybrid:
-            LOGGER.warning("WARNING ⚠️ --save-hybrid returns high mAP from hybrid labels, not from predictions alone")
+            LOGGER.warning("--save-hybrid returns high mAP from hybrid labels, not from predictions alone")
         run(**vars(opt))
 
     else:
@@ -511,7 +455,7 @@ def main(opt):
                     r, _, t = run(**vars(opt), plots=False)
                     y.append(r + t)  # results and times
                 np.savetxt(f, y, fmt="%10.4g")  # save
-            subprocess.run(["zip", "-r", "study.zip", "study_*.txt"])
+            subprocess.run(["zip", "-r", "study.zip", *glob.glob("study_*.txt")], check=False)
             plot_val_study(x=x)  # plot
         else:
             raise NotImplementedError(f'--task {opt.task} not in ("train", "val", "test", "speed", "study")')

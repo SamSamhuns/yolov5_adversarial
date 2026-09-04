@@ -7,12 +7,12 @@ import numpy as np
 import torch
 
 from utils.general import LOGGER, colorstr
-from utils.torch_utils import profile
+from utils.torch_utils import profile, smart_amp_autocast
 
 
 def check_train_batch_size(model, imgsz=640, amp=True):
     """Checks and computes optimal training batch size for YOLOv5 model, given image size and AMP setting."""
-    with torch.cuda.amp.autocast(amp):
+    with smart_amp_autocast(amp):
         return autobatch(deepcopy(model).train(), imgsz)  # compute optimal batch size
 
 
@@ -32,7 +32,7 @@ def autobatch(model, imgsz=640, fraction=0.8, batch_size=16):
         LOGGER.info(f"{prefix}CUDA not detected, using default CPU batch-size {batch_size}")
         return batch_size
     if torch.backends.cudnn.benchmark:
-        LOGGER.info(f"{prefix} ⚠️ Requires torch.backends.cudnn.benchmark=False, using default batch-size {batch_size}")
+        LOGGER.warning(f"{prefix}Requires torch.backends.cudnn.benchmark=False, using default batch-size {batch_size}")
         return batch_size
 
     # Inspect CUDA memory
@@ -52,6 +52,7 @@ def autobatch(model, imgsz=640, fraction=0.8, batch_size=16):
         results = profile(img, model, n=3, device=device)
     except Exception as e:
         LOGGER.warning(f"{prefix}{e}")
+        return batch_size
 
     # Fit a solution
     y = [x[2] for x in results if x]  # memory [2]
@@ -63,7 +64,7 @@ def autobatch(model, imgsz=640, fraction=0.8, batch_size=16):
             b = batch_sizes[max(i - 1, 0)]  # select prior safe point
     if b < 1 or b > 1024:  # b outside of safe range
         b = batch_size
-        LOGGER.warning(f"{prefix}WARNING ⚠️ CUDA anomaly detected, recommend restart environment and retry command.")
+        LOGGER.warning(f"{prefix}CUDA anomaly detected, recommend restart environment and retry command.")
 
     fraction = (np.polyval(p, b) + r + a) / t  # actual fraction predicted
     LOGGER.info(f"{prefix}Using batch-size {b} for {d} {t * fraction:.2f}G/{t:.2f}G ({fraction * 100:.0f}%) ✅")
