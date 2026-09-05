@@ -1,6 +1,6 @@
 """
 This module implements GradCAM module for YOLOv5 in order to see where the model is attenting to.
-Requirements: pip install grad-cam==1.4.6
+Requirements: pip install grad-cam==1.4.6.
 
 python explainer.py --weights runs/train/s_coco_e300_4Class_PeopleVehicle/weights/best.pt --source runs/frame.png  --method EigenCAM
 """
@@ -40,12 +40,11 @@ from utils.torch_utils import select_device
 
 
 def yolo_reshape_transform(x):
-    """
-    The backbone outputs different tensors with different spatial sizes, from the FPN.
-    Our goal here is to aggregate these image tensors, assign them weights, and then aggregate everything.
-    To do that, we are going to need to write a custom function that takes these tensors with different sizes,
-    resizes them to a common shape, and concatenates them
-    https://jacobgil.github.io/pytorch-gradcam-book/Class%20Activation%20Maps%20for%20Object%20Detection%20With%20Faster%20RCNN.html
+    """The backbone outputs different tensors with different spatial sizes, from the FPN. Our goal here is to aggregate
+    these image tensors, assign them weights, and then aggregate everything. To do that, we are going to need to
+    write a custom function that takes these tensors with different sizes, resizes them to a common shape, and
+    concatenates them
+    https://jacobgil.github.io/pytorch-gradcam-book/Class%20Activation%20Maps%20for%20Object%20Detection%20With%20Faster%20RCNN.html.
 
     it seems that output is always the same shape in yolo. So, this is not needed.
     """
@@ -53,12 +52,9 @@ def yolo_reshape_transform(x):
 
 
 class YOLOBoxScoreTarget:
-    """For every original detected bounding box specified in "bounding boxes",
-    assign a score on how the current bounding boxes match it,
-        1. In IOU
-        2. In the classification score.
-    If there is not a large enough overlap, or the category changed,
-    assign a score of 0.
+    """For every original detected bounding box specified in "bounding boxes", assign a score on how the current
+    bounding boxes match it, 1. In IOU 2. In the classification score. If there is not a large enough overlap, or
+    the category changed, assign a score of 0.
 
     The total score is the sum of all the box scores.
     """
@@ -68,10 +64,9 @@ class YOLOBoxScoreTarget:
         self.objectness_threshold = objectness_threshold
 
     def __call__(self, output):
-        """
-        here we need something which we can call backward
-        https://pub.towardsai.net/yolov5-m-implementation-from-scratch-with-pytorch-c8f84a66c98b
-        output structure is taken from this tutorial, it is as follows:
+        """Here we need something which we can call backward
+        https://pub.towardsai.net/yolov5-m-implementation-from-scratch-with-pytorch-c8f84a66c98b output
+        structure is taken from this tutorial, it is as follows:.
 
         first item is important, second item contains three arrays which contain prediction from three heads
         we would use the first array as it is the final prediction.
@@ -181,7 +176,7 @@ def run(
     vid_stride=1,  # video frame-rate stride
 ):
     source = str(source)
-    save_img = not nosave and not source.endswith(".txt")  # save inference images
+    not nosave and not source.endswith(".txt")  # save inference images
     is_file = Path(source).suffix[1:] in (IMG_FORMATS + VID_FORMATS)
     is_url = source.lower().startswith(("rtsp://", "rtmp://", "http://", "https://"))
     if is_url and is_file:

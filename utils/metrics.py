@@ -216,7 +216,7 @@ class ConfusionMatrix:
         ax.set_xlabel("True")
         ax.set_ylabel("Predicted")
         ax.set_title("Confusion Matrix")
-        fig.savefig(Path(save_dir) / save_name, dpi=250)
+        fig.savefig(Path(save_dir) / "confusion_matrix.png", dpi=250)
         plt.close(fig)
 
     def print(self):

@@ -1,5 +1,8 @@
 # specific to adv_patch_gen, yolov5 base requirements should be installed as well
-Cython==3.0.8
-easydict==1.12
-pycocotools==2.0.6
-tensorboard==2.16.2
+# Usage: pip install -r requirements.txt -r adv_patch_gen/requirements.txt
+
+easydict>=1.12,<2
+imagesize>=1.4.1,<2  # adv_patch_gen/conv_visdrone_2_yolo reads image dims without decoding
+pycocotools>=2.0.6,<3  # coco mAP for test_patch.py
+tensorboard>=2.16.2,<3  # tensorboard for test_patch.py
+tqdm>=4.70.0,<5

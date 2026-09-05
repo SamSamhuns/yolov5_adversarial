@@ -5,11 +5,13 @@ YOLOv7 requires an additional txt file (Same name as the first parent directory)
 val & test splits
 """
 
+from __future__ import annotations
+
 import argparse
 import glob
 import os
 import os.path as osp
-from typing import Optional
+from pathlib import Path
 
 import imagesize
 import tqdm
@@ -87,12 +89,11 @@ def conv_visdrone_2_yolo(
     source_annot_dir: str,
     source_image_dir: str,
     target_annot_dir: str,
-    low_dim_cutoff: Optional[int],
-    low_area_cutoff: Optional[float],
+    low_dim_cutoff: int | None,
+    low_area_cutoff: float | None,
 ):
-    """
-    low_dim_cutoff: int, lower cutoff for bounding boxes width/height dims in pixels
-    low_area_cutoff: float, lower area perc cutoff for bounding box areas in perc
+    """low_dim_cutoff: int, lower cutoff for bounding boxes width/height dims in pixels low_area_cutoff: float, lower
+    area perc cutoff for bounding box areas in perc.
     """
     if not all([osp.isdir(source_annot_dir), osp.isdir(source_image_dir)]):
         raise ValueError(
@@ -102,24 +103,23 @@ def conv_visdrone_2_yolo(
     src_image_path = osp.join(source_image_dir, "*")
     src_annot_paths = sorted(glob.glob(src_annot_path))
     src_image_paths = [p for p in sorted(glob.glob(src_image_path)) if osp.splitext(p)[-1] in IMG_EXT]
-    assert len(src_image_paths) == len(
-        src_annot_paths
-    ), f"Num src images: {len(src_image_paths)} & num src annots: {len(src_annot_paths)} do not match"
+    assert len(src_image_paths) == len(src_annot_paths), (
+        f"Num src images: {len(src_image_paths)} & num src annots: {len(src_annot_paths)} do not match"
+    )
 
     os.makedirs(target_annot_dir, exist_ok=True)
     low_dim_cutoff = float("-inf") if not low_dim_cutoff else low_dim_cutoff
     low_area_cutoff = float("-inf") if not low_area_cutoff else low_area_cutoff
-    target_img_list_fpath = osp.join(osp.dirname(target_annot_dir), source_annot_dir.split("/")[-2].lower() + ".txt")
+    split_name = Path(source_annot_dir).resolve().parent.name.lower()
+    target_img_list_fpath = osp.join(osp.dirname(target_annot_dir), split_name + ".txt")
 
-    with tqdm.tqdm(total=len(src_image_paths)) as pbar, open(target_img_list_fpath, "w") as imgw:
-        orig_box_count = new_box_count = 0
+    with tqdm.tqdm(total=len(src_image_paths)) as pbar, open(target_img_list_fpath, "w", encoding="utf-8") as imgw:
+        orig_box_count = new_box_count = skipped = 0
         for src_annot_file, src_image_file in zip(src_annot_paths, src_image_paths):
             try:
                 iw, ih = imagesize.get(src_image_file)
-                target_annot_file = osp.join(target_annot_dir, src_annot_file.split("/")[-1])
-                with open(src_annot_file, "r", encoding="utf-8") as fr, open(
-                    target_annot_file, "w", encoding="utf-8"
-                ) as fw:
+                target_annot_file = osp.join(target_annot_dir, osp.basename(src_annot_file))
+                with open(src_annot_file, encoding="utf-8") as fr, open(target_annot_file, "w", encoding="utf-8") as fw:
                     for coords in fr:
                         annots = list(map(int, coords.strip().strip(",").split(",")))
                         x, y = annots[0], annots[1]
@@ -138,7 +138,7 @@ def conv_visdrone_2_yolo(
                         # only use objects used for eval along and all levels of occlusion (0,1,2)
                         if score and occu <= 2:
                             class_id = CLASS_ID_REMAP[class_id] if CLASS_ID_REMAP else class_id
-                            fw.write(f"{class_id} {xc/iw} {yc/ih} {w/iw} {h/ih}\n")
+                            fw.write(f"{class_id} {xc / iw} {yc / ih} {w / iw} {h / ih}\n")
                             new_box_count += 1
                 target_image_path = osp.join(
                     osp.dirname(osp.dirname(target_annot_file)),
@@ -146,11 +146,18 @@ def conv_visdrone_2_yolo(
                     osp.basename(target_annot_file).split(".")[0] + osp.splitext(src_image_file)[1],
                 )
                 imgw.write(f"{osp.abspath(target_image_path)}\n")
-            except Exception as excep:
-                print(f"{excep}: Error reading img {src_image_file}")
+            except (OSError, ValueError, IndexError, KeyError) as excep:
+                # a malformed annot line or unreadable image, keep going but do not hide it
+                skipped += 1
+                print(f"{type(excep).__name__}: {excep}. Skipping {src_image_file}")
             pbar.update(1)
+        if skipped:
+            print(f"Skipped {skipped} of {len(src_image_paths)} images, see the errors above")
         print(f"Original Box Count: {orig_box_count}. Converted Box Count {new_box_count}")
-        print(f"{100 * (new_box_count) / orig_box_count:.2f}% of total boxes kept")
+        if orig_box_count:
+            print(f"{100 * new_box_count / orig_box_count:.2f}% of total boxes kept")
+        else:
+            print(f"No boxes of classes {sorted(CLASS_2_CONSIDER)} found in {source_annot_dir}")
 
 
 def main():

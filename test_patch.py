@@ -1,15 +1,15 @@
 """Testing code for evaluating Adversarial patches against object detection."""
 
+from __future__ import annotations
+
 import glob
 import io
 import json
 import os
 import os.path as osp
-import random
 import time
 from contextlib import redirect_stdout
 from pathlib import Path
-from typing import List, Optional, Tuple
 
 import numpy as np
 import torch
@@ -20,27 +20,20 @@ from pycocotools.coco import COCO
 from pycocotools.cocoeval import COCOeval
 from torchvision import transforms
 
-from adv_patch_gen.utils.common import IMG_EXTNS, BColors, pad_to_square
+from adv_patch_gen.utils.common import IMG_EXTNS, BColors, pad_to_square, set_seed
 from adv_patch_gen.utils.config_parser import get_argparser, load_config_object
+from adv_patch_gen.utils.model import load_detector, unwrap_preds
 from adv_patch_gen.utils.patch import PatchApplier, PatchTransformer
 from adv_patch_gen.utils.video import (
     ffmpeg_combine_three_vids,
     ffmpeg_combine_two_vids,
     ffmpeg_create_video_from_image_dir,
 )
-from models.common import DetectMultiBackend
 from utils.general import non_max_suppression, xyxy2xywh
 from utils.metrics import ConfusionMatrix
 from utils.plots import Annotator, colors
 from utils.torch_utils import select_device
 
-# optionally set seed for repeatability
-SEED = 42
-if SEED is not None:
-    random.seed(SEED)
-    np.random.seed(SEED)
-    torch.manual_seed(SEED)
-    torch.cuda.manual_seed(SEED)
 torch.backends.cudnn.benchmark = False
 
 
@@ -52,16 +45,31 @@ def eval_coco_metrics(anno_json: str, pred_json: str, txt_save_path: str, w_mode
 
     evaluator.evaluate()
     evaluator.accumulate()
-    evaluator.summarize()
 
-    # capture evaluator stats and save to file
+    # capture evaluator stats once, then print and save them
     std_out = io.StringIO()
     with redirect_stdout(std_out):
         evaluator.summarize()
     eval_stats = std_out.getvalue()
+    print(eval_stats)
     with open(txt_save_path, w_mode, encoding="utf-8") as fwriter:
         fwriter.write(eval_stats)
     return evaluator.stats
+
+
+def conf_matrix_tp_fp(conf_matrix: ConfusionMatrix) -> tuple[np.ndarray, np.ndarray]:
+    """Per class true and false positives from a confusion matrix, excluding the background class."""
+    tp = conf_matrix.matrix.diagonal()
+    fp = conf_matrix.matrix.sum(1) - tp
+    return tp[:-1], fp[:-1]
+
+
+def plot_conf_matrix(conf_matrix: ConfusionMatrix, save_dir: str, class_list: list[str], save_name: str) -> None:
+    """Plot a confusion matrix to save_dir/save_name. ConfusionMatrix.plot() always writes confusion_matrix.png."""
+    conf_matrix.plot(save_dir=save_dir, names=class_list)
+    default_path = osp.join(save_dir, "confusion_matrix.png")
+    if osp.isfile(default_path):
+        os.replace(default_path, osp.join(save_dir, save_name))
 
 
 class PatchTester:
@@ -71,46 +79,72 @@ class PatchTester:
         self.cfg = cfg
         self.dev = select_device(cfg.device)
 
-        model = DetectMultiBackend(cfg.weights_file, device=self.dev, dnn=False, data=None, fp16=False)
-        self.model = model.eval().to(self.dev)
+        # any DetectMultiBackend export format works here, testing needs no gradient
+        self.model = load_detector(cfg.weights_file, self.dev, cfg.get("model_backend"))
         self.patch_transformer = PatchTransformer(
-            cfg.target_size_frac, cfg.mul_gau_mean, cfg.mul_gau_std, cfg.x_off_loc, cfg.y_off_loc, self.dev
+            cfg.target_size_frac,
+            cfg.mul_gau_mean,
+            cfg.mul_gau_std,
+            cfg.x_off_loc,
+            cfg.y_off_loc,
+            self.dev,
+            medianpool_kernel=cfg.get("medianpool_kernel", 7),
+            perspective_scale=cfg.get("perspective_scale", 0.0),
+            illumination_scale=cfg.get("illumination_scale", 0.0),
         ).to(self.dev)
         self.patch_applier = PatchApplier(cfg.patch_alpha).to(self.dev)
+
+    @staticmethod
+    def as_class_id_list(cls_id) -> list[int] | None:
+        """Normalize an objective_class_id config value (None, int or list) to None or a list of ints."""
+        if cls_id is None:
+            return None
+        return [int(cls_id)] if isinstance(cls_id, (int, np.integer)) else [int(c) for c in cls_id]
+
+    @staticmethod
+    def class_mask(classes: torch.Tensor, cls_ids: list[int]) -> torch.Tensor:
+        """Boolean mask selecting rows whose class is any of cls_ids."""
+        if len(cls_ids) == 1:
+            return classes == cls_ids[0]
+        return torch.isin(classes, torch.tensor(cls_ids, device=classes.device, dtype=classes.dtype))
 
     @staticmethod
     def calc_asr(
         boxes,
         boxes_pred,
-        class_list: List[str],
+        class_list: list[str],
+        conf_thresh: float = 0.25,
         lo_area: float = 20**2,
         hi_area: float = 67**2,
-        cls_id: Optional[int] = None,
+        cls_id: int | None = None,
         class_agnostic: bool = False,
         recompute_asr_all: bool = False,
-    ) -> Tuple[float, float, float, float]:
-        """
-        Calculate attack success rate (How many bounding boxes were hidden from the detector) for all predictions and
+    ) -> tuple[float, float, float, float]:
+        """Calculate attack success rate (How many bounding boxes were hidden from the detector) for all predictions and
         for different bbox areas.
 
         Note cls_id is None, misclassifications are ignored and only missing detections are considered attack success.
+
         Args:
             boxes: torch.Tensor, first pass boxes (gt unpatched boxes) [class, x1, y1, x2, y2]
             boxes_pred: torch.Tensor, second pass boxes (patched boxes) [x1, y1, x2, y2, conf, class]
             class_list: list of class names in correct order
+            conf_thresh: confidence threshold used for the detections, forwarded to the confusion matrix
             lo_area: small bbox area threshold
             hi_area: large bbox area threshold
-            cls_id: filter for a particular class
+            cls_id: filter for a particular class, an int or a list of ints. None uses every class
             class_agnostic: All classes are considered the same
             recompute_asr_all: Recomputer ASR for all boxes aggregated together slower but more acc. asr
-        Return:
+
+        Returns:
             attack success rates bbox area tuple: small, medium, large, all
                 float, float, float, float
         """
         # if cls_id is provided and evaluation is not class agnostic then mis-clsfs count as attack success
-        if cls_id is not None:
-            boxes = boxes[boxes[:, 0] == cls_id]
-            boxes_pred = boxes_pred[boxes_pred[:, 5] == cls_id]
+        cls_ids = PatchTester.as_class_id_list(cls_id)
+        if cls_ids is not None:
+            boxes = boxes[PatchTester.class_mask(boxes[:, 0], cls_ids)]
+            boxes_pred = boxes_pred[PatchTester.class_mask(boxes_pred[:, 5], cls_ids)]
 
         boxes_area = (boxes[:, 3] - boxes[:, 1]) * (boxes[:, 4] - boxes[:, 2])
         boxes_pred_area = (boxes_pred[:, 2] - boxes_pred[:, 0]) * (boxes_pred[:, 3] - boxes_pred[:, 1])
@@ -124,19 +158,19 @@ class PatchTester:
         assert (bp_small.shape[0] + bp_med.shape[0] + bp_large.shape[0]) == boxes_pred.shape[0]
         assert (b_small.shape[0] + b_med.shape[0] + b_large.shape[0]) == boxes.shape[0]
 
-        conf_matrix = ConfusionMatrix(len(class_list))
+        conf_matrix = ConfusionMatrix(len(class_list), conf=conf_thresh)
         conf_matrix.process_batch(bp_small, b_small)
-        tps_small, fps_small = conf_matrix.tp_fp()
-        conf_matrix = ConfusionMatrix(len(class_list))
+        tps_small, fps_small = conf_matrix_tp_fp(conf_matrix)
+        conf_matrix = ConfusionMatrix(len(class_list), conf=conf_thresh)
         conf_matrix.process_batch(bp_med, b_med)
-        tps_med, fps_med = conf_matrix.tp_fp()
-        conf_matrix = ConfusionMatrix(len(class_list))
+        tps_med, fps_med = conf_matrix_tp_fp(conf_matrix)
+        conf_matrix = ConfusionMatrix(len(class_list), conf=conf_thresh)
         conf_matrix.process_batch(bp_large, b_large)
-        tps_large, fps_large = conf_matrix.tp_fp()
+        tps_large, fps_large = conf_matrix_tp_fp(conf_matrix)
         if recompute_asr_all:
-            conf_matrix = ConfusionMatrix(len(class_list))
+            conf_matrix = ConfusionMatrix(len(class_list), conf=conf_thresh)
             conf_matrix.process_batch(boxes_pred, boxes)
-            tps_all, fps_all = conf_matrix.tp_fp()
+            tps_all, fps_all = conf_matrix_tp_fp(conf_matrix)
         else:
             tps_all, fps_all = tps_small + tps_med + tps_large, fps_small + fps_med + fps_large
 
@@ -147,11 +181,11 @@ class PatchTester:
             tp_large = tps_large.sum() + fps_large.sum()
             tp_all = tps_all.sum() + fps_all.sum()
         # filtering by cls_id or non class_agnostic mode (Mis-clsfs are successes)
-        elif cls_id is not None:  # consider single class, mis-clsfs or non-dets
-            tp_small = tps_small[cls_id]
-            tp_med = tps_med[cls_id]
-            tp_large = tps_large[cls_id]
-            tp_all = tps_all[cls_id]
+        elif cls_ids is not None:  # consider the targeted classes only, mis-clsfs or non-dets
+            tp_small = tps_small[cls_ids].sum()
+            tp_med = tps_med[cls_ids].sum()
+            tp_large = tps_large[cls_ids].sum()
+            tp_all = tps_all[cls_ids].sum()
         else:  # non class_agnostic, mis-clsfs or non-dets
             tp_small = tps_small.sum()
             tp_med = tps_med.sum()
@@ -166,7 +200,7 @@ class PatchTester:
         return max(asr_small, 0.0), max(asr_medium, 0.0), max(asr_large, 0.0), max(asr_all, 0.0)
 
     @staticmethod
-    def draw_bbox_on_pil_image(bbox: np.ndarray, padded_img_pil: Image, class_list: List[str]) -> Image:
+    def draw_bbox_on_pil_image(bbox: np.ndarray, padded_img_pil: Image, class_list: list[str]) -> Image:
         """Draw bounding box on a PIL image and return said image after drawing."""
         padded_img_np = np.ascontiguousarray(padded_img_pil)
         label_2_class = dict(enumerate(class_list))
@@ -177,6 +211,57 @@ class PatchTester:
             label = f"{label_2_class[cls_int]} {conf:.2f}"
             annotator.box_label(xyxy, label, color=colors(cls_int, True))
         return Image.fromarray(padded_img_np)
+
+    def _detect(self, img_tensor, conf_thresh: float, nms_thresh: float, cls_id, min_pixel_area):
+        """Run the detector on one image, returning kept boxes [N, 6] xyxy conf cls, dets found, dets dropped."""
+        with torch.no_grad():
+            pred = unwrap_preds(self.model(img_tensor))
+            boxes = non_max_suppression(pred, conf_thresh, nms_thresh)[0]
+        # if doing targeted class performance check, ignore non target classes
+        cls_ids = PatchTester.as_class_id_list(cls_id)
+        if cls_ids is not None:
+            boxes = boxes[PatchTester.class_mask(boxes[:, -1], cls_ids)]
+        n_det = boxes.shape[0]
+        # filter det bounding boxes by pixel area
+        if min_pixel_area is not None:
+            boxes = boxes[((boxes[:, 2] - boxes[:, 0]) * (boxes[:, 3] - boxes[:, 1])) > min_pixel_area]
+        return boxes, n_det, n_det - boxes.shape[0]
+
+    def _record_dets(self, boxes, image_id, class_agnostic: bool, results: list, txtpath=None, gt_results=None):
+        """Append coco detections to results, optionally a yolo txt and coco gt, returning normalized labels."""
+        m_h, m_w = self.cfg.model_in_sz
+        labels, lines = [], []
+        for box in xyxy2xywh(boxes):
+            cls_id_box = box[-1].item()
+            score = box[4].item()
+            x_center, y_center, width, height = (val.item() for val in box[:4])
+            category_id = 0 if class_agnostic else int(cls_id_box)
+            bbox = [x_center - (width / 2), y_center - (height / 2), width, height]
+            labels.append([cls_id_box, x_center / m_w, y_center / m_h, width / m_w, height / m_h])
+            lines.append(f"{cls_id_box} {x_center / m_w} {y_center / m_h} {width / m_w} {height / m_h}\n")
+            results.append({"image_id": image_id, "bbox": bbox, "score": round(score, 5), "category_id": category_id})
+            if gt_results is not None:
+                gt_results.append(
+                    {
+                        "id": len(gt_results),
+                        "iscrowd": 0,
+                        "image_id": image_id,
+                        "bbox": bbox,
+                        "area": width * height,
+                        "category_id": category_id,
+                        "segmentation": [],
+                    }
+                )
+        if txtpath is not None:
+            with open(txtpath, "w+", encoding="utf-8") as textfile:
+                textfile.writelines(lines)
+        return labels
+
+    def _save_img(self, img_pil: Image, boxes, out_path: str, draw_bbox: bool) -> None:
+        """Save a PIL image, optionally with its detections drawn on."""
+        if draw_bbox:
+            img_pil = PatchTester.draw_bbox_on_pil_image(boxes, img_pil, self.cfg.class_list)
+        img_pil.save(out_path)
 
     def _create_coco_image_annot(self, file_path: Path, width: int, height: int, image_id: int) -> dict:
         file_path = file_path.name
@@ -197,14 +282,15 @@ class PatchTester:
         save_orig_padded_image: bool = True,
         draw_bbox_on_image: bool = True,
         class_agnostic: bool = False,
-        cls_id: Optional[int] = None,
-        min_pixel_area: Optional[int] = None,
+        cls_id: int | None = None,
+        min_pixel_area: int | None = None,
         save_plots: bool = False,
         save_video: bool = False,
         max_images: int = 100000,
+        apply_patch_transforms: bool = True,
     ) -> dict:
-        """
-        Initiate test for properly, randomly and no-patched images
+        """Initiate test for properly, randomly and no-patched images.
+
         Args:
             conf_thresh: confidence thres for successful detection/positives
             nms_thresh: nms thres
@@ -214,11 +300,14 @@ class PatchTester:
             draw_bbox_on_image: Draw bboxes on the original images and the random noise & properly patched images
             class_agnostic: all classes are treated the same. Use when only evaluating for obj det & not classification
             cls_id: filtering for a specific class for evaluation only
-            min_pixel_area: all bounding boxes having area less than this are filtered out during testing. if None, use all boxes
+            min_pixel_area: all bounding boxes having area less than this are filtered out during testing. if None, use
+                all boxes
             save_video: if set to true, eval videos are saved in directory videos
             max_images: max number of images to evaluate from inside imgdir
+            apply_patch_transforms: apply rotation, location shift, brightness and contrast transforms to the patch
+
         Returns:
-            dict of patch and noise coco_map and asr results
+            dict of patch and noise coco_map and asr results.
         """
         t_0 = time.time()
 
@@ -259,7 +348,7 @@ class PatchTester:
             json.dump(self.cfg, f_json, ensure_ascii=False, indent=4)
 
         # save patch to self.cfg.savedir
-        patch_save_path = osp.join(self.cfg.savedir, self.cfg.patchfile.split("/")[-1])
+        patch_save_path = osp.join(self.cfg.savedir, osp.basename(self.cfg.patchfile))
         transforms.ToPILImage(self.cfg.patch_img_mode)(adv_patch_cpu).save(patch_save_path)
 
         img_paths = glob.glob(osp.join(self.cfg.imgdir, "*"))
@@ -282,236 +371,84 @@ class PatchTester:
         all_noise_preds = []
         det_boxes = dropped_boxes = 0
 
-        # apply rotation, location shift, brightness, contrast transforms for patch
-        apply_patch_transforms = True
-
         #### iterate through all images ####
-        box_id = 0
         transforms_resize = transforms.Resize(model_in_sz)
         transforms_totensor = transforms.ToTensor()
         transforms_topil = transforms.ToPILImage("RGB")
         zeros_tensor = torch.zeros([1, 5]).to(self.dev)
         for imgfile in tqdm.tqdm(img_paths):
-            img_name = osp.splitext(imgfile)[0].split("/")[-1]
             imgfile_path = Path(imgfile)
-            image_id = int(imgfile_path.stem) if imgfile_path.stem.isnumeric() else imgfile_path.stem
-
-            clean_image_annotation = self._create_coco_image_annot(
-                imgfile_path, width=m_w, height=m_h, image_id=image_id
+            img_name = imgfile_path.stem
+            image_id = int(img_name) if img_name.isnumeric() else img_name
+            clean_image_annotations.append(
+                self._create_coco_image_annot(imgfile_path, width=m_w, height=m_h, image_id=image_id)
             )
-            clean_image_annotations.append(clean_image_annotation)
 
-            txtname = img_name + ".txt"
-            txtpath = osp.join(clean_txt_dir, txtname)
             # open image and adjust to yolo input size
-            padded_img_pil = pad_to_square(Image.open(imgfile).convert("RGB"))
-            padded_img_pil = transforms_resize(padded_img_pil)
+            padded_img_pil = transforms_resize(pad_to_square(Image.open(imgfile).convert("RGB")))
+            padded_img_tensor = transforms_totensor(padded_img_pil).unsqueeze(0).to(self.dev)
 
             #######################################
-            # generate labels to use later for patched image
-            padded_img_tensor = transforms_totensor(padded_img_pil).unsqueeze(0).to(self.dev)
-            with torch.no_grad():
-                pred = self.model(padded_img_tensor)
-                boxes = non_max_suppression(pred, conf_thresh, nms_thresh)[0]
-            # if doing targeted class performance check, ignore non target classes
-            if cls_id is not None:
-                boxes = boxes[boxes[:, -1] == cls_id]
-            count_before_drop = boxes.shape[0]
-            det_boxes += count_before_drop
-            # filter det bounding boxes by pixel area
-            if min_pixel_area is not None:
-                boxes = boxes[((boxes[:, 2] - boxes[:, 0]) * (boxes[:, 3] - boxes[:, 1])) > min_pixel_area]
-            dropped_boxes += count_before_drop - boxes.shape[0]
+            # clean pass, its detections are the labels the patched passes are scored against
+            boxes, n_det, n_dropped = self._detect(padded_img_tensor, conf_thresh, nms_thresh, cls_id, min_pixel_area)
+            det_boxes += n_det
+            dropped_boxes += n_dropped
             all_labels.append(boxes.clone())
-            boxes = xyxy2xywh(boxes)
+            labels = self._record_dets(
+                boxes,
+                image_id,
+                class_agnostic,
+                clean_results,
+                txtpath=osp.join(clean_txt_dir, img_name + ".txt") if save_txt else None,
+                gt_results=clean_gt_results,
+            )
 
-            labels = []
-            if save_txt:
-                textfile = open(txtpath, "w+", encoding="utf-8")
-            for box in boxes:
-                cls_id_box = box[-1].item()
-                score = box[4].item()
-                x_center, y_center, width, height = box[:4]
-                x_center, y_center, width, height = x_center.item(), y_center.item(), width.item(), height.item()
-                labels.append([cls_id_box, x_center / m_w, y_center / m_h, width / m_w, height / m_h])
-                if save_txt:
-                    textfile.write(f"{cls_id_box} {x_center/m_w} {y_center/m_h} {width/m_w} {height/m_h}\n")
-                clean_results.append(
-                    {
-                        "image_id": image_id,
-                        "bbox": [x_center - width / 2, y_center - height / 2, width, height],
-                        "score": round(score, 5),
-                        "category_id": 0 if class_agnostic else int(cls_id_box),
-                    }
-                )
-                clean_gt_results.append(
-                    {
-                        "id": box_id,
-                        "iscrowd": 0,
-                        "image_id": image_id,
-                        "bbox": [x_center - width / 2, y_center - height / 2, width, height],
-                        "area": width * height,
-                        "category_id": 0 if class_agnostic else int(cls_id_box),
-                        "segmentation": [],
-                    }
-                )
-                box_id += 1
-            if save_txt:
-                textfile.close()
-
-            # save img
-            cleanname = img_name + ".jpg"
             if save_image and save_orig_padded_image:
-                if draw_bbox_on_image:
-                    padded_img_drawn = PatchTester.draw_bbox_on_pil_image(
-                        all_labels[-1], padded_img_pil, self.cfg.class_list
-                    )
-                    padded_img_drawn.save(osp.join(clean_img_dir, cleanname))
-                else:
-                    padded_img_pil.save(osp.join(clean_img_dir, cleanname))
+                self._save_img(padded_img_pil, boxes, osp.join(clean_img_dir, img_name + ".jpg"), draw_bbox_on_image)
 
             # use a filler zeros array for no dets
-            label = np.asarray(labels) if labels else np.zeros([1, 5])
-            label = torch.from_numpy(label).float()
+            label = torch.from_numpy(np.asarray(labels) if labels else np.zeros([1, 5])).float()
             if label.dim() == 1:
                 label = label.unsqueeze(0)
-
-            #######################################
-            # Apply proper patches
-            img_fake_batch = padded_img_tensor
             lab_fake_batch = label.unsqueeze(0).to(self.dev)
-            if len(lab_fake_batch[0]) == 1 and torch.equal(lab_fake_batch[0], zeros_tensor):
-                # no det, use images without patches
-                p_tensor_batch = padded_img_tensor
-            else:
-                # transform patch and add it to image
-                adv_batch_t = self.patch_transformer(
-                    adv_patch,
-                    lab_fake_batch,
-                    model_in_sz,
-                    use_mul_add_gau=apply_patch_transforms,
-                    do_transforms=apply_patch_transforms,
-                    do_rotate=apply_patch_transforms,
-                    rand_loc=apply_patch_transforms,
-                )
-                p_tensor_batch = self.patch_applier(img_fake_batch, adv_batch_t)
-
-            properpatchedname = img_name + ".jpg"
-            # generate a label file for the image with sticker
-            txtname = properpatchedname.replace(".jpg", ".txt")
-            txtpath = osp.join(proper_txt_dir, txtname)
-
-            with torch.no_grad():
-                pred = self.model(p_tensor_batch)
-                boxes = non_max_suppression(pred, conf_thresh, nms_thresh)[0]
-            # if doing targeted class performance check, ignore non target classes
-            if cls_id is not None:
-                boxes = boxes[boxes[:, -1] == cls_id]
-            # filter det bounding boxes by pixel area
-            if min_pixel_area is not None:
-                boxes = boxes[((boxes[:, 2] - boxes[:, 0]) * (boxes[:, 3] - boxes[:, 1])) > min_pixel_area]
-            all_patch_preds.append(boxes.clone())
-            boxes = xyxy2xywh(boxes)
-
-            if save_txt:
-                textfile = open(txtpath, "w+", encoding="utf-8")
-            for box in boxes:
-                cls_id_box = box[-1].item()
-                score = box[4].item()
-                x_center, y_center, width, height = box[:4]
-                x_center, y_center, width, height = x_center.item(), y_center.item(), width.item(), height.item()
-                if save_txt:
-                    textfile.write(f"{cls_id_box} {x_center/m_w} {y_center/m_h} {width/m_w} {height/m_h}\n")
-                patch_results.append(
-                    {
-                        "image_id": image_id,
-                        "bbox": [x_center - (width / 2), y_center - (height / 2), width, height],
-                        "score": round(score, 5),
-                        "category_id": 0 if class_agnostic else int(cls_id_box),
-                    }
-                )
-            if save_txt:
-                textfile.close()
-
-            # save properly patched img
-            if save_image:
-                p_img_pil = transforms_topil(p_tensor_batch.squeeze(0).cpu())
-                if draw_bbox_on_image:
-                    p_img_pil_drawn = PatchTester.draw_bbox_on_pil_image(
-                        all_patch_preds[-1], p_img_pil, self.cfg.class_list
-                    )
-                    p_img_pil_drawn.save(osp.join(proper_img_dir, properpatchedname))
-                else:
-                    p_img_pil.save(osp.join(proper_img_dir, properpatchedname))
+            no_dets = len(lab_fake_batch[0]) == 1 and torch.equal(lab_fake_batch[0], zeros_tensor)
 
             #######################################
-            # Apply random patches
-            if len(lab_fake_batch[0]) == 1 and torch.equal(lab_fake_batch[0], zeros_tensor):
-                # no det, use images without patches
-                p_tensor_batch = padded_img_tensor
-            else:
-                # create a random patch, transform it and add it to image
-                random_patch = torch.rand(adv_patch_cpu.size()).to(self.dev)
-                adv_batch_t = self.patch_transformer(
-                    random_patch,
-                    lab_fake_batch,
-                    model_in_sz,
-                    use_mul_add_gau=apply_patch_transforms,
-                    do_transforms=apply_patch_transforms,
-                    do_rotate=apply_patch_transforms,
-                    rand_loc=apply_patch_transforms,
-                )
-                p_tensor_batch = self.patch_applier(img_fake_batch, adv_batch_t)
-
-            randompatchedname = img_name + ".jpg"
-            # generate a label file for the image with random patch
-            txtname = randompatchedname.replace(".jpg", ".txt")
-            txtpath = osp.join(random_txt_dir, txtname)
-
-            with torch.no_grad():
-                pred = self.model(p_tensor_batch)
-                boxes = non_max_suppression(pred, conf_thresh, nms_thresh)[0]
-            # if doing targeted class performance check, ignore non target classes
-            if cls_id is not None:
-                boxes = boxes[boxes[:, -1] == cls_id]
-            # filter det bounding boxes by pixel area
-            if min_pixel_area is not None:
-                boxes = boxes[((boxes[:, 2] - boxes[:, 0]) * (boxes[:, 3] - boxes[:, 1])) > min_pixel_area]
-            all_noise_preds.append(boxes.clone())
-            boxes = xyxy2xywh(boxes)
-
-            if save_txt:
-                textfile = open(txtpath, "w+", encoding="utf-8")
-            for box in boxes:
-                cls_id_box = box[-1].item()
-                score = box[4].item()
-                x_center, y_center, width, height = box[:4]
-                x_center, y_center, width, height = x_center.item(), y_center.item(), width.item(), height.item()
-                if save_txt:
-                    textfile.write(f"{cls_id_box} {x_center/m_w} {y_center/m_h} {width/m_w} {height/m_h}\n")
-                noise_results.append(
-                    {
-                        "image_id": image_id,
-                        "bbox": [x_center - (width / 2), y_center - (height / 2), width, height],
-                        "score": round(score, 5),
-                        "category_id": 0 if class_agnostic else int(cls_id_box),
-                    }
-                )
-            if save_txt:
-                textfile.close()
-
-            # save randomly patched img
-            if save_image:
-                p_img_pil = transforms_topil(p_tensor_batch.squeeze(0).cpu())
-                if draw_bbox_on_image:
-                    p_img_pil_drawn = PatchTester.draw_bbox_on_pil_image(
-                        all_noise_preds[-1], p_img_pil, self.cfg.class_list
-                    )
-                    p_img_pil_drawn.save(osp.join(random_img_dir, randompatchedname))
+            # proper patch pass, then random noise patch pass for a baseline
+            for patch, preds, results, txt_dir, img_dir in (
+                (adv_patch, all_patch_preds, patch_results, proper_txt_dir, proper_img_dir),
+                (None, all_noise_preds, noise_results, random_txt_dir, random_img_dir),
+            ):
+                if no_dets:  # nothing to patch, score the clean image again
+                    p_tensor_batch = padded_img_tensor
                 else:
-                    p_img_pil.save(osp.join(random_img_dir, randompatchedname))
+                    # None is the random noise baseline, drawn fresh for each image
+                    adv_batch_t = self.patch_transformer(
+                        torch.rand_like(adv_patch) if patch is None else patch,
+                        lab_fake_batch,
+                        model_in_sz,
+                        use_mul_add_gau=apply_patch_transforms,
+                        do_transforms=apply_patch_transforms,
+                        do_rotate=apply_patch_transforms,
+                        rand_loc=apply_patch_transforms,
+                        do_perspective=apply_patch_transforms,
+                    )
+                    p_tensor_batch = self.patch_applier(padded_img_tensor, adv_batch_t)
 
-        del adv_batch_t, padded_img_tensor, p_tensor_batch
+                boxes, _, _ = self._detect(p_tensor_batch, conf_thresh, nms_thresh, cls_id, min_pixel_area)
+                preds.append(boxes.clone())
+                self._record_dets(
+                    boxes,
+                    image_id,
+                    class_agnostic,
+                    results,
+                    txtpath=osp.join(txt_dir, img_name + ".txt") if save_txt else None,
+                )
+
+                if save_image:
+                    p_img_pil = transforms_topil(p_tensor_batch.squeeze(0).cpu())
+                    self._save_img(p_img_pil, boxes, osp.join(img_dir, img_name + ".jpg"), draw_bbox_on_image)
+
         torch.cuda.empty_cache()
 
         # reorder labels to (Array[M, 5]), class, x1, y1, x2, y2
@@ -522,17 +459,13 @@ class PatchTester:
 
         # Calc confusion matrices if not class_agnostic
         if not class_agnostic and save_plots:
-            patch_confusion_matrix = ConfusionMatrix(len(self.cfg.class_list))
+            patch_confusion_matrix = ConfusionMatrix(len(self.cfg.class_list), conf=conf_thresh)
             patch_confusion_matrix.process_batch(all_patch_preds, all_labels)
-            noise_confusion_matrix = ConfusionMatrix(len(self.cfg.class_list))
+            noise_confusion_matrix = ConfusionMatrix(len(self.cfg.class_list), conf=conf_thresh)
             noise_confusion_matrix.process_batch(all_noise_preds, all_labels)
 
-            patch_confusion_matrix.plot(
-                save_dir=self.cfg.savedir, names=self.cfg.class_list, save_name="conf_matrix_patch.png"
-            )
-            noise_confusion_matrix.plot(
-                save_dir=self.cfg.savedir, names=self.cfg.class_list, save_name="conf_matrix_noise.png"
-            )
+            plot_conf_matrix(patch_confusion_matrix, self.cfg.savedir, self.cfg.class_list, "conf_matrix_patch.png")
+            plot_conf_matrix(noise_confusion_matrix, self.cfg.savedir, self.cfg.class_list, "conf_matrix_noise.png")
 
         # add all required fields for a reference GT clean annotation
         clean_gt_results_json = {"annotations": clean_gt_results, "categories": [], "images": clean_image_annotations}
@@ -566,7 +499,12 @@ class PatchTester:
         coco_map_patch = eval_coco_metrics(clean_gt_json, patch_json, patch_txt_path) if patch_results else []
 
         asr_s, asr_m, asr_l, asr_a = PatchTester.calc_asr(
-            all_labels, all_patch_preds, self.cfg.class_list, cls_id=cls_id, class_agnostic=class_agnostic
+            all_labels,
+            all_patch_preds,
+            self.cfg.class_list,
+            conf_thresh=conf_thresh,
+            cls_id=cls_id,
+            class_agnostic=class_agnostic,
         )
         with open(patch_txt_path, "a", encoding="utf-8") as f_patch:
             asr_str = ""
@@ -579,10 +517,15 @@ class PatchTester:
         metrics_patch = {"coco_map": coco_map_patch, "asr": [asr_s, asr_m, asr_l, asr_a]}
 
         print(f"{BColors.HEADER}### Metrics for images with random noise patches ###{BColors.ENDC}")
-        coco_map_noise = eval_coco_metrics(clean_gt_json, noise_json, noise_txt_path) if clean_results else []
+        coco_map_noise = eval_coco_metrics(clean_gt_json, noise_json, noise_txt_path) if noise_results else []
 
         asr_s, asr_m, asr_l, asr_a = PatchTester.calc_asr(
-            all_labels, all_noise_preds, self.cfg.class_list, cls_id=cls_id, class_agnostic=class_agnostic
+            all_labels,
+            all_noise_preds,
+            self.cfg.class_list,
+            conf_thresh=conf_thresh,
+            cls_id=cls_id,
+            class_agnostic=class_agnostic,
         )
         with open(noise_txt_path, "a", encoding="utf-8") as f_noise:
             asr_str = ""
@@ -634,9 +577,10 @@ def main():
         type=float,
         nargs="+",
         dest="target_size_frac",
-        default=[0.3],
+        default=None,
         required=False,
-        help="Patch target_size_frac of the bbox area. Providing two values sets a range. (default: %(default)s)",
+        help="Patch target_size_frac of the bbox area. Two values set a range. "
+        'If unset, use "target_size_frac" in cfg json (default: %(default)s)',
     )
     parser.add_argument(
         "-w",
@@ -682,6 +626,20 @@ def main():
         help="Conf threshold for detection (default: %(default)s)",
     )
     parser.add_argument(
+        "--nms-thresh",
+        type=float,
+        dest="nms_thresh",
+        default=0.4,
+        required=False,
+        help="IoU threshold for NMS (default: %(default)s)",
+    )
+    parser.add_argument(
+        "--no-patch-transforms",
+        dest="no_patch_transforms",
+        action="store_true",
+        help="Disable the random rotation, location shift, brightness and contrast transforms on the patch",
+    )
+    parser.add_argument(
         "--save-txt",
         dest="savetxt",
         action="store_true",
@@ -697,7 +655,7 @@ def main():
         help="Combine no-patch, random-patch and proper-patched images into videos",
     )
     parser.add_argument(
-        "--save-plot", dest="saveplots", action="store_true", help="Save the confusion matrix plots, PR, P & R curves"
+        "--save-plot", dest="saveplots", action="store_true", help="Save the patch and noise confusion matrix plots"
     )
     parser.add_argument(
         "--class-agnostic",
@@ -708,10 +666,11 @@ def main():
     parser.add_argument(
         "--target-class",
         type=int,
+        nargs="+",
         dest="target_class",
         default=None,
         required=False,
-        help="Target specific class with id for misclassification test (default: %(default)s)",
+        help="Target one or more class ids for the misclassification test (default: %(default)s)",
     )
     parser.add_argument(
         "--min-pixel-area",
@@ -724,20 +683,21 @@ def main():
 
     args = parser.parse_args()
     cfg = load_config_object(args.config)
+    set_seed(cfg.get("seed", 42))
     cfg.device = args.device if args.device is not None else cfg.device
     cfg.weights_file = (
         args.weights if args.weights is not None else cfg.weights_file
     )  # check if cfg.weights_file is ignored
     cfg.patchfile = args.patchfile
     cfg.imgdir = args.imgdir
-    args.target_size_frac = args.target_size_frac[0] if len(args.target_size_frac) == 1 else args.target_size_frac
-    cfg.target_size_frac = args.target_size_frac
+    if args.target_size_frac is not None:
+        if len(args.target_size_frac) not in {1, 2}:
+            raise ValueError("target_size_frac can only have one or two values")
+        cfg.target_size_frac = args.target_size_frac[0] if len(args.target_size_frac) == 1 else args.target_size_frac
 
-    if not isinstance(args.target_size_frac, float) and len(args.target_size_frac) != 2:
-        raise ValueError("target_size_frac can only have one or two values")
     if args.savevideo and not args.saveimg:
         raise ValueError("To save videos, images must also be saved pass both --save-img & --save-vid flags")
-    savename = f'{time.strftime("%Y%m%d-%H%M%S")}_' + cfg.patch_name
+    savename = f"{time.strftime('%Y%m%d-%H%M%S')}_" + cfg.patch_name
     if args.class_agnostic and args.target_class is not None:
         print(
             f"""{BColors.WARNING}WARNING:{BColors.ENDC} target_class and class_agnostic are both set.
@@ -745,7 +705,7 @@ def main():
         )
         args.target_class = None
     else:
-        savename += f"_tc{args.target_class}" if args.target_class is not None else ""
+        savename += ("_tc" + "-".join(str(c) for c in args.target_class)) if args.target_class else ""
     savename += "_agnostic" if args.class_agnostic else ""
     savename += f"_gt{args.min_pixel_area}" if args.min_pixel_area is not None else ""
     cfg.savedir = osp.join(args.savedir, savename)
@@ -754,6 +714,7 @@ def main():
     tester = PatchTester(cfg)
     tester.test(
         conf_thresh=args.conf_thresh,
+        nms_thresh=args.nms_thresh,
         save_txt=args.savetxt,
         save_image=args.saveimg,
         class_agnostic=args.class_agnostic,
@@ -761,6 +722,7 @@ def main():
         min_pixel_area=args.min_pixel_area,
         save_plots=args.saveplots,
         save_video=args.savevideo,
+        apply_patch_transforms=not args.no_patch_transforms,
     )
 
 
