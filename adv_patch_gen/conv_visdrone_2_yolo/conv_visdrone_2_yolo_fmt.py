@@ -5,12 +5,13 @@ YOLOv7 requires an additional txt file (Same name as the first parent directory)
 val & test splits
 """
 
+from __future__ import annotations
+
 import argparse
 import glob
 import os
 import os.path as osp
 from pathlib import Path
-from typing import Optional
 
 import imagesize
 import tqdm
@@ -88,12 +89,11 @@ def conv_visdrone_2_yolo(
     source_annot_dir: str,
     source_image_dir: str,
     target_annot_dir: str,
-    low_dim_cutoff: Optional[int],
-    low_area_cutoff: Optional[float],
+    low_dim_cutoff: int | None,
+    low_area_cutoff: float | None,
 ):
-    """
-    low_dim_cutoff: int, lower cutoff for bounding boxes width/height dims in pixels
-    low_area_cutoff: float, lower area perc cutoff for bounding box areas in perc
+    """low_dim_cutoff: int, lower cutoff for bounding boxes width/height dims in pixels low_area_cutoff: float, lower
+    area perc cutoff for bounding box areas in perc.
     """
     if not all([osp.isdir(source_annot_dir), osp.isdir(source_image_dir)]):
         raise ValueError(
@@ -119,9 +119,7 @@ def conv_visdrone_2_yolo(
             try:
                 iw, ih = imagesize.get(src_image_file)
                 target_annot_file = osp.join(target_annot_dir, osp.basename(src_annot_file))
-                with open(src_annot_file, "r", encoding="utf-8") as fr, open(
-                    target_annot_file, "w", encoding="utf-8"
-                ) as fw:
+                with open(src_annot_file, encoding="utf-8") as fr, open(target_annot_file, "w", encoding="utf-8") as fw:
                     for coords in fr:
                         annots = list(map(int, coords.strip().strip(",").split(",")))
                         x, y = annots[0], annots[1]

@@ -26,9 +26,9 @@
     "patch_size": [64, 64],                 # (int, int): must be (height, width)
     "objective_class_id": null,             # int or [int, ...]: class id(s) to target. Use null for a general attack on all classes
     "min_pixel_area": null,                 # int: min pixel area to use for training. Pixel area chosen after resizing to model in size
-    "augment_image": true,                  # bool: photometric augmentation (blur, colour jitter, sharpness) plus label aware hflip
+    "augment_image": true,                  # bool: photometric augmentation (blur, color jitter, sharpness) plus label aware hflip
     "augment_stage": "post",                # str: "post" augments the PATCHED image so the patch is degraded by the same camera
-                                            # response as the scene (physically correct). "pre" is the old behaviour. Defaults to post
+                                            # response as the scene (physically correct). "pre" is the old behavior. Defaults to post
     "target_size_frac": 0.3,                # float: patch proportion size compared to bbox size. Range also accepted i.e. [0.25, 0.4]
     "use_mul_add_gau": true,                # bool: use mul & add gaussian noise or not to patches
     "mul_gau_mean": 0.5,                    # float: mul gaussian noise mean (reduces contrast) mean. Range also accepted i.e. [0.25, 0.4]

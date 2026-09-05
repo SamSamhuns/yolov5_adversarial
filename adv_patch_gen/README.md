@@ -30,7 +30,7 @@ If the `pip install -r requirements.txt` is not working.
 
 ```bash
 pip install Cython
-sudo apt-get install python3.8-dev  # or any desired python version
-pip install pycocotools  # https://github.com/ppwwyyxx/cocoapi
+sudo apt-get install python3.8-dev # or any desired python version
+pip install pycocotools            # https://github.com/ppwwyyxx/cocoapi
 # pip install git+https://github.com/philferriere/cocoapi.git#subdirectory=PythonAPI  # depreciated
 ```

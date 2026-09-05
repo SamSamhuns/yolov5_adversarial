@@ -14,14 +14,14 @@ pytest.importorskip("torchvision")
 pytest.importorskip("easydict")
 pytest.importorskip("PIL")
 
-import numpy as np  # noqa: E402
-from easydict import EasyDict  # noqa: E402
-from PIL import Image as PILImage  # noqa: E402
+import numpy as np
+from easydict import EasyDict
+from PIL import Image as PILImage
 
-from adv_patch_gen.utils.config_parser import validate_config  # noqa: E402
-from adv_patch_gen.utils.dataset import YOLODataset  # noqa: E402
-from adv_patch_gen.utils.loss import MaxProbExtractor, NPSLoss, SaliencyLoss, TotalVariationLoss  # noqa: E402
-from adv_patch_gen.utils.patch import PatchApplier, PatchTransformer  # noqa: E402
+from adv_patch_gen.utils.config_parser import validate_config
+from adv_patch_gen.utils.dataset import YOLODataset
+from adv_patch_gen.utils.loss import MaxProbExtractor, NPSLoss, SaliencyLoss, TotalVariationLoss
+from adv_patch_gen.utils.patch import PatchApplier, PatchTransformer
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 BASE_CFG = REPO_ROOT / "adv_patch_gen/configs/base.json"
@@ -82,7 +82,7 @@ class TestPatchTransformer:
 
         x0, y0, x1, y1 = nonzero_bbox(out[0, 0])
         cx, cy = (x0 + x1) / 2, (y0 + y1) / 2
-        assert abs(cx - 320) <= 2 and abs(cy - 320) <= 2, f"patch centred at {(cx, cy)}, expected ~(320, 320)"
+        assert abs(cx - 320) <= 2 and abs(cy - 320) <= 2, f"patch centered at {(cx, cy)}, expected ~(320, 320)"
 
         # target_size = t_size_frac * sqrt((w*m_w)^2 + (h*m_h)^2)
         expected = 0.3 * ((0.2 * 640) ** 2 + (0.2 * 640) ** 2) ** 0.5
@@ -226,7 +226,6 @@ class TestLosses:
         out[0, 3, 5] = 0.7
         out[1, 0, 6] = 0.4
         assert torch.allclose(MaxProbExtractor(cfg)(out), torch.tensor([0.7, 0.4]), atol=1e-6)
-
 
     def test_topk_of_one_is_the_original_max(self):
         cfg = SimpleNamespace(n_classes=2, objective_class_id=None, loss_target=lambda o, c: o * c, loss_topk=1)
@@ -393,16 +392,16 @@ class TestBboxPatcher:
     """The detector-side patch augmentation, whose definition a merge with ultralytics dropped."""
 
     def test_dataloaders_import_chain_is_intact(self):
-        """utils.dataloaders is imported by models.common, so a missing BboxPatcher breaks
-        train.py, val.py, detect.py and export.py, not just the adv patch code."""
-        import utils.dataloaders  # noqa: F401, PLC0415
-
-        from utils.dataloaders import BboxPatcher  # noqa: PLC0415
+        """utils.dataloaders is imported by models.common, so a missing BboxPatcher breaks train.py, val.py, detect.py
+        and export.py, not just the adv patch code.
+        """
+        import utils.dataloaders  # noqa: F401
+        from utils.dataloaders import BboxPatcher
 
         assert BboxPatcher is not None
 
     def test_no_patches_is_a_passthrough(self, tmp_path):
-        from adv_patch_gen.utils.bbox_patch_aug import BboxPatcher  # noqa: PLC0415
+        from adv_patch_gen.utils.bbox_patch_aug import BboxPatcher
 
         patcher = BboxPatcher(patch_dir=str(tmp_path))
         assert patcher.patches == []
@@ -411,12 +410,12 @@ class TestBboxPatcher:
         assert np.array_equal(patcher(img, boxes), img)
 
     def test_empty_patch_dir_string_does_not_glob_the_cwd(self):
-        from adv_patch_gen.utils.bbox_patch_aug import BboxPatcher  # noqa: PLC0415
+        from adv_patch_gen.utils.bbox_patch_aug import BboxPatcher
 
         assert BboxPatcher(patch_dir="").patches == []
 
     def test_patch_is_pasted_onto_the_box(self, tmp_path):
-        from adv_patch_gen.utils.bbox_patch_aug import BboxPatcher  # noqa: PLC0415
+        from adv_patch_gen.utils.bbox_patch_aug import BboxPatcher
 
         patch_dir = tmp_path / "patches"
         patch_dir.mkdir()
@@ -432,7 +431,7 @@ class TestBboxPatcher:
         assert np.array_equal(out[:24, :24], img[:24, :24]), "corners far from the box must be untouched"
 
     def test_zero_apply_probability_leaves_the_image_alone(self, tmp_path):
-        from adv_patch_gen.utils.bbox_patch_aug import BboxPatcher  # noqa: PLC0415
+        from adv_patch_gen.utils.bbox_patch_aug import BboxPatcher
 
         patch_dir = tmp_path / "patches"
         patch_dir.mkdir()
@@ -442,7 +441,7 @@ class TestBboxPatcher:
         assert np.array_equal(patcher(img, np.array([[0, 32, 32, 96, 96]])), img)
 
     def test_degenerate_boxes_are_skipped(self, tmp_path):
-        from adv_patch_gen.utils.bbox_patch_aug import BboxPatcher  # noqa: PLC0415
+        from adv_patch_gen.utils.bbox_patch_aug import BboxPatcher
 
         patch_dir = tmp_path / "patches"
         patch_dir.mkdir()

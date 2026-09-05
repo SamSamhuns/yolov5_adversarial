@@ -23,7 +23,7 @@ https://github.com/SamSamhuns/yolov5_adversarial/assets/13418507/b389449f-98a4-4
 Note: Install all required dependencies as mentioned in the main YOLOv5 repository and install additional yolov5 adversarial dependency as follows:
 
 ```shell
-pip install -r requirements.txt  # yolov5 reqs
+pip install -r requirements.txt # yolov5 reqs
 pip install -r adv_patch_gen/requirements.txt
 ```
 
@@ -62,7 +62,7 @@ Instructions in creating the config json file present at [adv_patch_gen/configs/
 
 ```shell
 python test_patch.py --cfg CONFIG_JSON_FILE -w YOLOV5_TARGET_MODEL_WEIGHTS_PATH -p PATCH_IMG_FILE_PATH --id IMG_DIR_PATH_FOR_TESTING --sd SAVE_DIR_PATH
-python test_patch.py -h  # to get a list of all testing options
+python test_patch.py -h # to get a list of all testing options
 ```
 
 ## Attack Success Rate of patches tested against the VisDrone-2019 dataset

@@ -1,8 +1,9 @@
 """Common utils."""
 
+from __future__ import annotations
+
 import random
 import socket
-from typing import Optional, Tuple
 
 import numpy as np
 import torch
@@ -12,10 +13,8 @@ IMG_EXTNS = {".png", ".jpg", ".jpeg"}
 
 
 class BColors:
-    """
-    Border Color values for pretty printing in terminal
-    Sample Use:
-        print(f"{BColors.WARNING}Warning: Information.{BColors.ENDC}"
+    """Border Color values for pretty printing in terminal Sample Use: print(f"{BColors.WARNING}Warning:
+    Information.{BColors.ENDC}".
     """
 
     HEADER = "\033[95m"
@@ -29,7 +28,7 @@ class BColors:
     UNDERLINE = "\033[4m"
 
 
-def set_seed(seed: Optional[int]) -> None:
+def set_seed(seed: int | None) -> None:
     """Seed python, numpy and torch RNGs for repeatability. A None seed leaves them untouched."""
     if seed is None:
         return
@@ -45,7 +44,7 @@ def is_port_in_use(port: int) -> bool:
         return stream.connect_ex(("localhost", int(port))) == 0
 
 
-def pad_to_square(img: Image, pad_rgb: Tuple[int, int, int] = (127, 127, 127)) -> Image:
+def pad_to_square(img: Image, pad_rgb: tuple[int, int, int] = (127, 127, 127)) -> Image:
     """Pads a PIL image to a square with pad_rgb values to the longest side."""
     w, h = img.size
     if w == h:

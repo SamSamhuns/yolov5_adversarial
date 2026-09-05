@@ -2,9 +2,10 @@
 image must have a corresponding label file with the same name.
 """
 
+from __future__ import annotations
+
 import glob
 import os.path as osp
-from typing import Optional, Tuple
 
 import numpy as np
 import torch
@@ -17,17 +18,17 @@ from adv_patch_gen.utils.common import IMG_EXTNS, pad_to_square
 
 
 class YOLODataset(Dataset):
-    """
-    Create a dataset for adversarial-yolt.
+    """Create a dataset for adversarial-yolt.
 
     Attributes:
         image_dir: Directory containing the images of the YOLO format dataset.
         label_dir: Directory containing the labels of the YOLO format dataset.
         max_labels: max number labels to use for each image
         model_in_sz: model input image size (height, width)
-        use_even_odd_images: optionally load a data subset based on the last numeric char of the img filename [all, even, odd]
-        transform: photometric augmentation applied to the image. Note that applying it here means the
-            patch, which is composited later, never sees it. Prefer augmenting after compositing.
+        use_even_odd_images: optionally load a data subset based on the last numeric char of the img filename [all,
+            even, odd]
+        transform: photometric augmentation applied to the image. Note that applying it here means the patch, which is
+            composited later, never sees it. Prefer augmenting after compositing.
         hflip_prob: probability of a label aware horizontal flip
         filter_class_id: np.ndarray class id(s) to get. Set None to get all classes
         min_pixel_area: min pixel area below which all boxes are filtered out. (Out of the model in size area)
@@ -38,12 +39,12 @@ class YOLODataset(Dataset):
         image_dir: str,
         label_dir: str,
         max_labels: int,
-        model_in_sz: Tuple[int, int],
+        model_in_sz: tuple[int, int],
         use_even_odd_images: str = "all",
-        transform: Optional[torch.nn.Module] = None,
+        transform: torch.nn.Module | None = None,
         hflip_prob: float = 0.0,
-        filter_class_ids: Optional[np.array] = None,
-        min_pixel_area: Optional[int] = None,
+        filter_class_ids: np.array | None = None,
+        min_pixel_area: int | None = None,
     ):
         assert use_even_odd_images in {"all", "even", "odd"}, "use_even_odd param can only be all, even or odd"
         image_paths = sorted(p for p in glob.glob(osp.join(image_dir, "*")) if osp.splitext(p)[-1] in IMG_EXTNS)

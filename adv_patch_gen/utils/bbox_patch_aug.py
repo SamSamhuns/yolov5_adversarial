@@ -10,9 +10,10 @@ train.py, val.py, detect.py and export.py. It lives here so the yolov5 tree only
 line rather than carrying ~100 lines of fork code that a future merge can drop again.
 """
 
+from __future__ import annotations
+
 import glob
 import os
-from typing import Tuple
 
 import cv2
 import numpy as np
@@ -29,21 +30,21 @@ class BboxPatcher:
     def __init__(
         self,
         patch_dir: str,
-        rotation_range: Tuple[float, float] = (-20, 20),
-        scale_range: Tuple[float, float] = (0.10, 0.30),
-        brightness_range: Tuple[float, float] = (0.9, 1.1),
-        contrast_range: Tuple[float, float] = (0.8, 1.2),
-        m_gau_mean: Tuple[float, float] = (0.7, 0.9),
-        m_gau_std: Tuple[float, float] = (0.1, 0.1),
+        rotation_range: tuple[float, float] = (-20, 20),
+        scale_range: tuple[float, float] = (0.10, 0.30),
+        brightness_range: tuple[float, float] = (0.9, 1.1),
+        contrast_range: tuple[float, float] = (0.8, 1.2),
+        m_gau_mean: tuple[float, float] = (0.7, 0.9),
+        m_gau_std: tuple[float, float] = (0.1, 0.1),
         patch_apply_prob: float = 0.5,
     ):
         """
         Args:
-            patch_dir: dir with patch images. An empty or missing dir leaves self.patches empty,
-                which callers check before applying.
+            patch_dir: dir with patch images. An empty or missing dir leaves self.patches empty, which callers check
+                before applying.
             rotation_range: rotation range in degrees
             scale_range: patch area as a fraction of the bbox area
-            patch_apply_prob: probability that any one box receives a patch
+            patch_apply_prob: probability that any one box receives a patch.
         """
         self.patches = []
         for patch_path in sorted(glob.glob(os.path.join(patch_dir, "*"))) if patch_dir else []:
@@ -62,9 +63,9 @@ class BboxPatcher:
 
     def __call__(self, image: np.ndarray, bbox_coords: np.ndarray) -> np.ndarray:
         """
-        Arguments:
+        Args:
             image: np.ndarray, image of shape H,W,C
-            bbox_coords: np.ndarray, [[cls,x1,y1,x2,y2], ...]
+            bbox_coords: np.ndarray, [[cls,x1,y1,x2,y2], ...].
         """
         if not self.patches or len(bbox_coords) == 0:
             return image

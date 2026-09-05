@@ -58,7 +58,7 @@ def main():
         key = cv2.waitKey()
         if key == ord("q"):
             cv2.destroyAllWindows()
-            exit()
+            sys.exit()
 
 
 if __name__ == "__main__":
