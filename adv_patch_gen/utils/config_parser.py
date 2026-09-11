@@ -64,6 +64,10 @@ OPTIONAL_KEYS = {
     "augment_stage",  # "post" augments the patched image, "pre" the image before compositing
     "model_backend",  # "yolov5" or "ultralytics" for v8/v11 weights
     "val_target_size_frac",  # patch scale used during validation, null uses the training midpoint
+    "val_max_images",  # cap on val images scored per epoch, null uses the whole val dir
+    "val_seed",  # seed pinning the val nuisance draws so epochs are comparable
+    "blur_sigma_max",  # max per instance defocus blur sigma, 0 disables
+    "printable_quantize",  # snap patch pixels to the triplet_printfile palette, for printed patches
 }
 AUGMENT_STAGES = {"pre", "post"}
 MODEL_BACKENDS = {"yolov5", "ultralytics"}
@@ -137,6 +141,16 @@ def validate_config(cfg: edict) -> edict:
     val_frac = cfg.get("val_target_size_frac")
     if val_frac is not None and not (isinstance(val_frac, (int, float)) and val_frac > 0):
         errors.append(f"val_target_size_frac must be null or a positive number, got {val_frac}")
+    val_max = cfg.get("val_max_images")
+    if val_max is not None and not (isinstance(val_max, int) and val_max > 0):
+        errors.append(f"val_max_images must be null or a positive int, got {val_max}")
+    blur = cfg.get("blur_sigma_max", 0.0)
+    if not (isinstance(blur, (int, float)) and 0 <= blur < 10):
+        errors.append(f"blur_sigma_max must be a number in [0, 10), got {blur}")
+    if not isinstance(cfg.get("printable_quantize", False), bool):
+        errors.append(f"printable_quantize must be a bool, got {cfg.printable_quantize}")
+    elif cfg.get("printable_quantize") and cfg.patch_img_mode != "RGB":
+        errors.append(f"printable_quantize needs an RGB patch, got patch_img_mode {cfg.patch_img_mode}")
 
     _check_pair(cfg, "model_in_sz", errors, positive=True)
     _check_pair(cfg, "patch_size", errors, positive=True)

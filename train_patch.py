@@ -22,7 +22,7 @@ from torch.utils.tensorboard import SummaryWriter
 from torchvision import transforms as T
 from tqdm import tqdm
 
-from adv_patch_gen.utils.common import IMG_EXTNS, is_port_in_use, pad_to_square, set_seed
+from adv_patch_gen.utils.common import IMG_EXTNS, is_port_in_use, pad_to_square, seed_worker, set_seed
 from adv_patch_gen.utils.config_parser import get_argparser, load_config_object
 from adv_patch_gen.utils.dataset import YOLODataset
 from adv_patch_gen.utils.loss import MaxProbExtractor, NPSLoss, SaliencyLoss, TotalVariationLoss
@@ -39,8 +39,9 @@ torch.backends.cudnn.benchmark = False
 class PatchTrainer:
     """Module for training on dataset to generate adv patches."""
 
-    def __init__(self, cfg: edict):
+    def __init__(self, cfg: edict, resume: str | None = None):
         self.cfg = cfg
+        self.resume = resume
         self.dev = select_device(cfg.device)
 
         self.model = load_detector(cfg.weights_file, self.dev, cfg.get("model_backend"))
@@ -61,6 +62,9 @@ class PatchTrainer:
             medianpool_kernel=cfg.get("medianpool_kernel", 7),
             perspective_scale=cfg.get("perspective_scale", 0.0),
             illumination_scale=cfg.get("illumination_scale", 0.0),
+            blur_sigma_max=cfg.get("blur_sigma_max", 0.0),
+            # reuse the NPS triplet file as the palette, it is the same list of printable colors
+            printable_quantize=cfg.triplet_printfile if cfg.get("printable_quantize") else None,
         ).to(self.dev)
         self.patch_applier = PatchApplier(cfg.patch_alpha).to(self.dev)
         self.prob_extractor = MaxProbExtractor(cfg).to(self.dev)
@@ -72,8 +76,15 @@ class PatchTrainer:
         for param in self.model.parameters():
             param.requires_grad = False
 
-        # set log dir
-        cfg.log_dir = osp.join(cfg.log_dir, f"{time.strftime('%Y%m%d-%H%M%S')}_{cfg.patch_name}")
+        # set log dir. A resumed run writes back into the run its checkpoint came from
+        # (<log_dir>/patches/last.pt), so the tensorboard curves and saved patches stay continuous
+        # instead of scattering across a fresh timestamped dir every restart.
+        if resume:
+            if not osp.isfile(resume):
+                raise FileNotFoundError(f"--resume checkpoint not found: {resume}")
+            cfg.log_dir = osp.dirname(osp.dirname(osp.abspath(resume)))
+        else:
+            cfg.log_dir = osp.join(cfg.log_dir, f"{time.strftime('%Y%m%d-%H%M%S')}_{cfg.patch_name}")
         self.writer = self.init_tensorboard(cfg.log_dir, cfg.tensorboard_port, cfg.get("run_tensorboard", True))
         # save config parameters to tensorboard logs
         for cfg_key, cfg_val in cfg.items():
@@ -110,6 +121,10 @@ class PatchTrainer:
             shuffle=True,
             num_workers=4,
             pin_memory=self.dev.type == "cuda",
+            # without these the workers reseed off entropy every run, so two runs of the same config
+            # see different augmentation draws and cannot be compared
+            worker_init_fn=seed_worker,
+            generator=torch.Generator().manual_seed(cfg.get("seed", 42)),
         )
         self.epoch_length = len(self.train_loader)
 
@@ -159,6 +174,19 @@ class PatchTrainer:
         adv_patch_cpu = T.ToTensor()(patch_img)
         return adv_patch_cpu
 
+    def export_patch(self, adv_patch: torch.Tensor) -> Image.Image:
+        """The patch exactly as it will be deployed.
+
+        With printable_quantize on, the forward pass sees a palette snapped patch through a straight
+        through estimator while the optimized tensor stays continuous. The exported png has to be
+        snapped too, or the artifact that actually gets printed is not the one the attack was tuned
+        against. Saving as an 8 bit png already covers the plain quantization case.
+        """
+        patch = adv_patch.detach()
+        if self.patch_transformer.palette is not None:
+            patch = self.patch_transformer.quantize(patch)
+        return T.ToPILImage(self.cfg.patch_img_mode)(patch.cpu())
+
     def train(self) -> None:
         """Optimize a patch to generate an adversarial example."""
         # make output dirs
@@ -188,7 +216,10 @@ class PatchTrainer:
         adv_patch = adv_patch_cpu.to(self.dev).requires_grad_(True)
 
         optimizer = optim.Adam([adv_patch], lr=self.cfg.start_lr, amsgrad=True)
-        scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, "min", patience=50)
+        # Cosine decay over the whole run. ReduceLROnPlateau with a 50 epoch patience never exhausted
+        # on this noisy per epoch loss, so the patch used to train at start_lr start to finish and jitter
+        # instead of settling.
+        scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=self.cfg.n_epochs)
         # AMP is a cuda only path both here and in the yolov5 helpers
         use_amp = self.cfg.use_amp and self.dev.type == "cuda"
         if self.cfg.use_amp and not use_amp:
@@ -197,8 +228,23 @@ class PatchTrainer:
 
         best_asr = -1.0
         best_patch_path = osp.join(patch_dir, "best.png")
+        ckpt_path = osp.join(patch_dir, "last.pt")
+        start_epoch = 1
+        if self.resume:
+            ckpt = torch.load(self.resume, map_location=self.dev)
+            adv_patch.data.copy_(ckpt["patch"].to(self.dev))
+            optimizer.load_state_dict(ckpt["optim"])
+            scheduler.load_state_dict(ckpt["sched"])
+            # T_max comes back from the checkpoint, so keep it consistent with the config in hand.
+            # Without this a resume past the original n_epochs walks off the end of the old cosine and
+            # the lr climbs back up. Note it still resumes at the cosine floor, because the schedule it
+            # was given has finished: start a fresh run rather than extending n_epochs to get a new decay.
+            scheduler.T_max = self.cfg.n_epochs
+            best_asr = ckpt["best_asr"]
+            start_epoch = ckpt["epoch"] + 1
+            print(f"Resumed {self.resume} at epoch {start_epoch}, best_asr={best_asr:.3f}")
         start_time = time.time()
-        for epoch in range(1, self.cfg.n_epochs + 1):
+        for epoch in range(start_epoch, self.cfg.n_epochs + 1):
             out_patch_path = osp.join(patch_dir, f"e_{epoch}.png")
             ep_loss = 0
             min_tv_loss = torch.tensor(self.cfg.min_tv_loss, device=self.dev)
@@ -210,7 +256,7 @@ class PatchTrainer:
                 with autograd.set_detect_anomaly(mode=bool(self.cfg.debug_mode)):
                     img_batch = img_batch.to(self.dev, non_blocking=True)
                     lab_batch = lab_batch.to(self.dev, non_blocking=True)
-                    adv_batch_t = self.patch_transformer(
+                    adv_batch_t, msk_batch_t = self.patch_transformer(
                         adv_patch,
                         lab_batch,
                         self.cfg.model_in_sz,
@@ -220,7 +266,7 @@ class PatchTrainer:
                         rand_loc=self.cfg.random_patch_loc,
                         do_perspective=True,
                     )
-                    p_img_batch = self.patch_applier(img_batch, adv_batch_t)
+                    p_img_batch = self.patch_applier(img_batch, adv_batch_t, msk_batch_t)
                     if self.post_augment is not None:
                         p_img_batch = self.post_augment(p_img_batch)
 
@@ -251,12 +297,16 @@ class PatchTrainer:
                     scaler.scale(loss).backward()
                     scaler.step(optimizer)
                     scaler.update()
+                    # scaler.step has already unscaled, so this is the true norm. Only computed on
+                    # logging batches, .item() forces a sync.
+                    log_now = i_batch % self.cfg.tensorboard_batch_log_interval == 0
+                    grad_norm = adv_patch.grad.norm().item() if log_now and adv_patch.grad is not None else 0.0
                     optimizer.zero_grad(set_to_none=True)
                     # keep patch in cfg image pixel range
                     pl, ph = self.cfg.patch_pixel_range
                     adv_patch.data.clamp_(pl / 255, ph / 255)
 
-                    if i_batch % self.cfg.tensorboard_batch_log_interval == 0:
+                    if log_now:
                         iteration = self.epoch_length * epoch + i_batch
                         self.writer.add_scalar("total_loss", loss.detach().cpu().numpy(), iteration)
                         self.writer.add_scalar("loss/det_loss", det_loss.detach().cpu().numpy(), iteration)
@@ -265,30 +315,57 @@ class PatchTrainer:
                         self.writer.add_scalar("loss/tv_loss", tv_loss.detach().cpu().numpy(), iteration)
                         self.writer.add_scalar("misc/epoch", epoch, iteration)
                         self.writer.add_scalar("misc/learning_rate", optimizer.param_groups[0]["lr"], iteration)
+                        self.writer.add_scalar("misc/grad_norm", grad_norm, iteration)
                         self.writer.add_image("patch", adv_patch, iteration)
                     if i_batch + 1 < len(self.train_loader):
-                        del adv_batch_t, output, max_prob, det_loss, p_img_batch, sal_loss, nps_loss, tv_loss, loss
+                        del (
+                            adv_batch_t,
+                            msk_batch_t,
+                            output,
+                            max_prob,
+                            det_loss,
+                            p_img_batch,
+                            sal_loss,
+                            nps_loss,
+                            tv_loss,
+                            loss,
+                        )
                         # torch.cuda.empty_cache()  # note emptying cache adds too much overhead
             ep_loss = ep_loss / len(self.train_loader)
-            scheduler.step(ep_loss)
+            scheduler.step()
+            self.writer.add_scalar("loss/epoch_mean", ep_loss.detach().cpu().numpy(), epoch)
 
             # save patch after every patch_save_epoch_freq epochs
             if epoch % self.cfg.patch_save_epoch_freq == 0:
-                img = T.ToPILImage(self.cfg.patch_img_mode)(adv_patch.detach().cpu())
-                img.save(out_patch_path)
-                del adv_batch_t, output, max_prob, det_loss, p_img_batch, sal_loss, nps_loss, tv_loss, loss
+                self.export_patch(adv_patch).save(out_patch_path)
+                del adv_batch_t, msk_batch_t, output, max_prob, det_loss, p_img_batch, sal_loss, nps_loss, tv_loss, loss
                 # torch.cuda.empty_cache()  # note emptying cache adds too much overhead
 
             # run validation to calc asr on val set if self.val_dir is not None
             if all([self.cfg.val_image_dir, self.cfg.val_epoch_freq]) and epoch % self.cfg.val_epoch_freq == 0:
                 if not osp.isfile(out_patch_path):  # val reads the patch back from disk
-                    T.ToPILImage(self.cfg.patch_img_mode)(adv_patch.detach().cpu()).save(out_patch_path)
+                    self.export_patch(adv_patch).save(out_patch_path)
                 with torch.no_grad():
                     asr_a = self.val(epoch, out_patch_path)
                 if asr_a > best_asr:
                     best_asr = asr_a
-                    T.ToPILImage(self.cfg.patch_img_mode)(adv_patch.detach().cpu()).save(best_patch_path)
+                    self.export_patch(adv_patch).save(best_patch_path)
                     print(f"New best patch at epoch {epoch}, asr_a={asr_a:.3f}, saved to {best_patch_path}")
+
+            # checkpoint last so --resume picks up mid run. Patch runs are long and physical ones longer.
+            torch.save(
+                {
+                    "epoch": epoch,
+                    "patch": adv_patch.detach().cpu(),
+                    "optim": optimizer.state_dict(),
+                    "sched": scheduler.state_dict(),
+                    "best_asr": best_asr,
+                },
+                ckpt_path + ".tmp",
+            )
+            # rename rather than write in place: being killed mid write is exactly the case this
+            # checkpoint exists for, and a half written last.pt loses the whole run
+            os.replace(ckpt_path + ".tmp", ckpt_path)
         if best_asr >= 0:
             print(f"Best val asr_a={best_asr:.3f}, best patch at {best_patch_path}")
         print(f"Total training time {time.time() - start_time:.2f}s")
@@ -302,6 +379,17 @@ class PatchTrainer:
 
         img_paths = glob.glob(osp.join(self.cfg.val_image_dir, "*"))
         img_paths = sorted([p for p in img_paths if osp.splitext(p)[-1] in IMG_EXTNS])
+        # a fixed prefix of the sorted list, so scoring more often stays affordable and every epoch
+        # still sees the same images
+        if self.cfg.get("val_max_images"):
+            img_paths = img_paths[: self.cfg.val_max_images]
+
+        # Pin the nuisance draws so ASR is comparable across epochs. Without this the patch transforms
+        # are redrawn every val and best.png tracks luck rather than progress. Only the seed is fixed,
+        # the distribution is untouched, so the score stays representative of a deployed patch.
+        rng_torch, rng_np = torch.get_rng_state(), np.random.get_state()
+        rng_cuda = torch.cuda.get_rng_state_all() if self.dev.type == "cuda" else None
+        set_seed(self.cfg.get("val_seed", 0))
 
         train_t_size_frac = self.patch_transformer.t_size_frac
         # score at one fixed scale so epochs are comparable, defaulting to the middle of the
@@ -361,7 +449,7 @@ class PatchTrainer:
                 p_tensor_batch = padded_img_tensor
             else:
                 # transform patch and add it to image
-                adv_batch_t = self.patch_transformer(
+                adv_batch_t, msk_batch_t = self.patch_transformer(
                     adv_patch,
                     lab_fake_batch,
                     self.cfg.model_in_sz,
@@ -370,7 +458,7 @@ class PatchTrainer:
                     do_rotate=self.cfg.rotate_patches,
                     rand_loc=self.cfg.random_patch_loc,
                 )
-                p_tensor_batch = self.patch_applier(img_fake_batch, adv_batch_t)
+                p_tensor_batch = self.patch_applier(img_fake_batch, adv_batch_t, msk_batch_t)
 
             pred = unwrap_preds(self.model(p_tensor_batch))
             boxes = non_max_suppression(pred, conf_thresh, nms_thresh)[0]
@@ -406,15 +494,26 @@ class PatchTrainer:
         self.writer.add_scalar("val_asr_per_epoch/area_all", asr_a, epoch)
         torch.cuda.empty_cache()
         self.patch_transformer.t_size_frac = train_t_size_frac
+        # hand training back the RNG stream it would have had, so validating does not perturb it
+        torch.set_rng_state(rng_torch)
+        np.random.set_state(rng_np)
+        if rng_cuda is not None:
+            torch.cuda.set_rng_state_all(rng_cuda)
         return float(asr_a)
 
 
 def main():
     parser = get_argparser()
+    parser.add_argument(
+        "--resume",
+        type=str,
+        default=None,
+        help="Path to a runs/.../patches/last.pt checkpoint to continue training from",
+    )
     args = parser.parse_args()
     cfg = load_config_object(args.config)
     set_seed(cfg.get("seed", 42))
-    trainer = PatchTrainer(cfg)
+    trainer = PatchTrainer(cfg, resume=args.resume)
     trainer.train()
 
 

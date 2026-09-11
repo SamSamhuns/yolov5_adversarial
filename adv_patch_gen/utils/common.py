@@ -38,6 +38,13 @@ def set_seed(seed: int | None) -> None:
     torch.cuda.manual_seed_all(seed)
 
 
+def seed_worker(_worker_id: int) -> None:
+    """DataLoader worker_init_fn. torch already offsets each worker's base seed, this carries that
+    offset into the python and numpy RNGs the dataset augmentations actually draw from.
+    """
+    set_seed(torch.initial_seed() % 2**32)
+
+
 def is_port_in_use(port: int) -> bool:
     """Checks if a port is free for use."""
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as stream:

@@ -9,6 +9,7 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
+from adv_patch_gen.utils.loss import NPSLoss
 from adv_patch_gen.utils.median_pool import MedianPool2d
 
 
@@ -34,6 +35,8 @@ class PatchTransformer(nn.Module):
         medianpool_kernel: int = 7,
         perspective_scale: float = 0.0,
         illumination_scale: float = 0.0,
+        blur_sigma_max: float = 0.0,
+        printable_quantize: str | None = None,
     ):
         super().__init__()
         # convert to duplicated lists/tuples to unpack and send to np.random.uniform
@@ -60,8 +63,43 @@ class PatchTransformer(nn.Module):
         self.perspective_scale = perspective_scale
         # linear brightness ramp across the patch, standing in for directional light and soft shadow
         self.illumination_scale = illumination_scale
+        # defocus blur, one sigma per rendered instance, standing in for varying camera distance
+        self.blur_sigma_max = blur_sigma_max
+        # printable rgb triplets the patch is snapped to, so the optimized patch is exactly what a
+        # printer can reproduce rather than merely nudged towards it by the NPS loss
+        self.palette = None
+        if printable_quantize:
+            self.palette = nn.Parameter(
+                NPSLoss.get_printability_array(printable_quantize).squeeze(-1).squeeze(-1), requires_grad=False
+            )
 
         self.tensor = torch.FloatTensor if "cpu" in str(dev) else torch.cuda.FloatTensor
+
+    def quantize(self, adv_patch: torch.Tensor) -> torch.Tensor:
+        """Snap [C, H, W] to the printable palette, passing gradient straight through the round."""
+        flat = adv_patch.permute(1, 2, 0).reshape(-1, adv_patch.size(0))  # [H*W, C]
+        nearest = self.palette[torch.cdist(flat, self.palette).argmin(dim=1)]
+        snapped = nearest.view(adv_patch.size(1), adv_patch.size(2), -1).permute(2, 0, 1)
+        return adv_patch + (snapped - adv_patch).detach()
+
+    def _random_blur(self, adv_batch: torch.Tensor) -> torch.Tensor:
+        """Defocus blur with one sigma per rendered instance. adv_batch is [N, C, H, W].
+
+        A separable depthwise conv with a per instance kernel, so every patch in the step sees a
+        different amount of blur. The batch wide GaussianBlur in the training script draws once per
+        batch, which does not model objects sitting at different distances from the camera.
+        """
+        n, c, h, w = adv_batch.shape
+        radius = 3  # fixed so the conv shape stays static, sigma alone carries the randomness
+        sigma = self.tensor(n).uniform_(1e-3, self.blur_sigma_max)
+        offsets = torch.arange(-radius, radius + 1, device=adv_batch.device, dtype=adv_batch.dtype)
+        kern = torch.exp(-(offsets[None, :] ** 2) / (2 * sigma[:, None] ** 2))
+        kern = kern / kern.sum(dim=1, keepdim=True)  # [n, 2 * radius + 1]
+        kern = kern.repeat_interleave(c, dim=0).unsqueeze(1)  # [n * c, 1, 2 * radius + 1]
+        grouped = adv_batch.reshape(1, n * c, h, w)
+        grouped = F.conv2d(grouped, kern.unsqueeze(2), padding=(0, radius), groups=n * c)
+        grouped = F.conv2d(grouped, kern.unsqueeze(3), padding=(radius, 0), groups=n * c)
+        return grouped.view(n, c, h, w)
 
     def forward(
         self,
@@ -74,8 +112,16 @@ class PatchTransformer(nn.Module):
         rand_loc=True,
         do_perspective=True,
     ):
-        # add gaussian noise to reduce contrast with a stohastic process
         p_c, p_h, p_w = adv_patch.shape
+        # The patch ships as an 8 bit png, and for a physical attack through a printer. Fold both
+        # constraints in with a straight through estimator so the tensor being optimized is the one
+        # that actually gets deployed, rather than a float32 stand in that loses ASR on export.
+        if self.palette is not None:
+            adv_patch = self.quantize(adv_patch)
+        else:
+            adv_patch = adv_patch + ((adv_patch * 255).round() / 255 - adv_patch).detach()
+
+        # add gaussian noise to reduce contrast with a stohastic process
         if use_mul_add_gau:
             mul_gau = torch.normal(
                 np.random.uniform(*self.m_gau_mean),
@@ -144,7 +190,10 @@ class PatchTransformer(nn.Module):
 
         # Resizes and rotates
         p_h_pooled, p_w_pooled = adv_batch.size(-2), adv_batch.size(-1)
-        tsize = np.random.uniform(*self.t_size_frac)
+        # one scale per rendered instance. This used to be a single python scalar, so all
+        # bsize * max_labels renders in a step shared one scale, leaving the dominant nuisance for a
+        # physical patch as the least randomized thing in the pipeline.
+        tsize = self.tensor(batch_size).uniform_(*self.t_size_frac)
         # patch is sized off the bbox diagonal in model input pixels
         target_size = tsize * torch.sqrt(((lab_batch[:, :, 3] * m_w) ** 2) + ((lab_batch[:, :, 4] * m_h) ** 2))
         # zero area filler rows would give scale 0 and hence inf in theta below, so give them a
@@ -170,6 +219,8 @@ class PatchTransformer(nn.Module):
         s = adv_batch.size()
         adv_batch = adv_batch.reshape(s[0] * s[1], s[2], s[3], s[4])
         msk_batch = msk_batch.reshape(s[0] * s[1], 1, s[3], s[4])
+        if self.blur_sigma_max > 0:
+            adv_batch = self._random_blur(adv_batch)
 
         tx = (-target_x + 0.5) * 2
         ty = (-target_y + 0.5) * 2
@@ -209,37 +260,35 @@ class PatchTransformer(nn.Module):
 
         adv_batch_t = torch.clamp(adv_batch_t, 0.000001, 0.999999)
 
-        return adv_batch_t * msk_batch_t
+        # The mask is returned rather than multiplied in. Multiplying darkened every patch border,
+        # because grid_sample resamples the mask to fractional values at the edges, so the patch got
+        # faded towards black instead of blended with the scene. PatchApplier composites with it.
+        return adv_batch_t, msk_batch_t
 
 
 class PatchApplier(nn.Module):
-    r"""PatchApplier: applies adversarial patches to images.
+    r"""PatchApplier: composites the transformed patches onto the images they were placed for.
 
-    Module providing the functionality necessary to apply a patch to all detections in all images in the batch. The
-    patch (adv_batch) has the same size as the image, just is zero everywhere there isn't a patch. If patch_alpha == 1
-    (default), just overwrite the background image values with the patch values. Else, blend the patch with the image
+    Takes the patch canvases and their coverage masks from PatchTransformer and alpha composites one label at a time:
+
+        I = \alpha F + (1 - \alpha) B
+            F = foreground (patch, or adv_batch)
+            B = background (image, or img_batch)
+            \alpha = patch coverage (msk_batch) scaled by patch_alpha
+
+    Because the mask carries the fractional coverage grid_sample produced, patch edges blend with the scene instead of
+    being faded towards black, and patch_alpha needs no separate branch: it just scales alpha.
     See: https://learnopencv.com/alpha-blending-using-opencv-cpp-python/
          https://stackoverflow.com/questions/49737541/merge-two-images-with-alpha-channel/49738078
-        I = \alpha F + (1 - \alpha) B
-            F = foregraound (patch, or adv_batch)
-            B = background (image, or img_batch)
     """
 
     def __init__(self, patch_alpha: float = 1):
         super().__init__()
         self.patch_alpha = patch_alpha
 
-    def forward(self, img_batch, adv_batch):
-        advs = torch.unbind(adv_batch, 1)
-        for adv in advs:
-            # replace image values with patch values
-            if self.patch_alpha == 1:
-                img_batch = torch.where((adv == 0), img_batch, adv)
-            # alpha blend
-            else:
-                # get combo of image and adv
-                alpha_blend = self.patch_alpha * adv + (1.0 - self.patch_alpha) * img_batch
-                # apply alpha blend where the patch is non-zero
-                img_batch = torch.where((adv == 0), img_batch, alpha_blend)
+    def forward(self, img_batch, adv_batch, msk_batch):
+        for adv, msk in zip(torch.unbind(adv_batch, 1), torch.unbind(msk_batch, 1)):
+            alpha = msk * self.patch_alpha
+            img_batch = img_batch * (1 - alpha) + adv * alpha
 
         return img_batch

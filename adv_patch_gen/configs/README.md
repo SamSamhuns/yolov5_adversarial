@@ -17,8 +17,13 @@
     "seed": 42,                             # int: RNG seed for repeatability. Use null for a non deterministic run. Defaults to 42 when omitted
     "use_amp": true,
     "patch_name": "base",
-    "val_epoch_freq": 100,
+    "val_epoch_freq": 10,                   # int: epochs between validation runs. best.png can only be picked from epochs that ran
+                                            # val, so a coarse value makes "best" close to arbitrary
     "val_target_size_frac": null,           # float: patch scale used for validation. null uses the midpoint of target_size_frac
+    "val_max_images": 200,                  # int: cap on val images scored per epoch, a fixed prefix of the sorted list.
+                                            # null scores the whole val dir. Lets val_epoch_freq stay small
+    "val_seed": 0,                          # int: pins the val nuisance draws so ASR is comparable epoch to epoch. The training
+                                            # RNG stream is saved and restored around val, so this does not perturb training
     "patch_save_epoch_freq": 1,             # int freq for saving patches. 1 means save after every epoch
     "model_in_sz": [640, 640],              # (int, int): model input height, width
     "patch_src": "gray",                    # str: gray random, or path_to_init_patch
@@ -39,6 +44,8 @@
     "rotate_patches": true,                 # bool: rotate patches or not
     "perspective_scale": 0.1,               # float [0,1): out of plane tilt of the patch (keystone). 0 disables
     "illumination_scale": 0.2,              # float [0,1): linear brightness ramp across the patch, directional light/shadow. 0 disables
+    "blur_sigma_max": 0.6,                  # float [0,10): defocus blur, one sigma drawn per rendered patch, standing in for objects
+                                            # at different distances from the camera. 0 disables
     "transform_patches": true,              # bool: add bightness, contrast and noise transforms to patches or not
     "patch_pixel_range": [0, 255],          # [int, int]: patch pixel range, range is [0, 255], numbers div by 255 in patches
     "patch_alpha": 1,                       # float: patch opacity, recommended to set to 1
@@ -48,8 +55,9 @@
     "max_labels": 48,
     "start_lr": 0.03,
     "min_tv_loss": 0.1,
-    "sal_mult": 1.0,                        # float: saliency (colorfulness) loss weight. The loss is an absolute metric in ~[0, 1],
-                                            # i.e. on the same scale as the det loss, so retune this if your config predates that fix
+    "sal_mult": 0.1,                        # float: saliency (colorfulness) loss weight. The loss is an absolute metric in ~[0, 1],
+                                            # i.e. on the same scale as the det loss, and it suppresses exactly the colorfulness that
+                                            # makes a patch strong, so keep it well below 1
     "tv_mult": 2.5,
     "nps_mult": 0.01,                       # float: Use 0.01 when not using sal. With sal use 0.001
     "batch_size": 8,
@@ -57,6 +65,9 @@
     "loss_target": "obj * cls",             # str: 'obj', 'cls', 'obj * cls'. A v8/v11 head has no objectness, use 'cls' or 'obj * cls' there
     "loss_topk": 10,                        # int >=1: mean of the k highest scoring predictions. 1 is the original single max, which
                                             # sends gradient to 1 of ~25k predictions per image at 640x640
-    "medianpool_kernel": 7                  # odd int: median filter over the patch each forward. Larger low passes the patch harder
-                                            # and routes gradient to fewer pixels. 0 or 1 disables it
+    "medianpool_kernel": 3,                 # odd int: median filter over the patch each forward. Larger low passes the patch harder
+                                            # and routes gradient to fewer pixels. 7 on a 64px patch is 11% of its width. 0 or 1 disables
+    "printable_quantize": false             # bool: snap patch pixels to the triplet_printfile palette each forward, with a straight
+                                            # through gradient, so the optimized patch is exactly printable. Stronger and coarser than
+                                            # nps_mult; A/B the two rather than leaning hard on both
 ```

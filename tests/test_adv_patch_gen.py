@@ -44,8 +44,8 @@ def make_transformer(**kwargs):
     return PatchTransformer(**opts).to(DEV)
 
 
-def transform(patch, lab, **fwd):
-    """Apply the transformer with every stochastic knob off unless overridden."""
+def transform_pair(patch, lab, **fwd):
+    """(adv_batch, msk_batch) from the transformer, every stochastic knob off unless overridden."""
     opts = {
         "use_mul_add_gau": False,
         "do_transforms": False,
@@ -56,6 +56,12 @@ def transform(patch, lab, **fwd):
     opts.update({k: v for k, v in fwd.items() if k in opts})
     tf = make_transformer(**{k: v for k, v in fwd.items() if k not in opts})
     return tf(patch, lab, MODEL_IN_SZ, **opts)
+
+
+def transform(patch, lab, **fwd):
+    """Patch canvases with coverage folded in, the geometry the placement tests reason about."""
+    adv, msk = transform_pair(patch, lab, **fwd)
+    return adv * msk
 
 
 def nonzero_bbox(plane):
@@ -152,19 +158,101 @@ class TestPatchApplier:
 
     def test_patch_replaces_only_where_it_landed(self):
         img = torch.full((1, 3, 640, 640), 0.25)
-        adv = transform(torch.full((3, 64, 64), 0.9), labels((0, 0.5, 0.5, 0.2, 0.2)))
-        out = PatchApplier(1.0)(img, adv)
+        adv, msk = transform_pair(torch.full((3, 64, 64), 0.9), labels((0, 0.5, 0.5, 0.2, 0.2)))
+        out = PatchApplier(1.0)(img, adv, msk)
 
-        covered = adv[0].abs().sum(0).sum(0) > 0  # [H, W]
+        covered = msk[0].sum(0).sum(0) > 0  # [H, W]
         assert torch.allclose(out[0, :, ~covered], torch.tensor(0.25)), "background must be untouched"
         assert not torch.allclose(out[0, :, covered], torch.tensor(0.25)), "patch area must change"
 
     def test_alpha_blend_is_between_image_and_patch(self):
         img = torch.zeros(1, 3, 640, 640)
-        adv = transform(torch.full((3, 64, 64), 1.0), labels((0, 0.5, 0.5, 0.2, 0.2)))
-        blended = PatchApplier(0.5)(img, adv)
-        covered = adv[0].abs().sum(0).sum(0) > 0
+        adv, msk = transform_pair(torch.full((3, 64, 64), 1.0), labels((0, 0.5, 0.5, 0.2, 0.2)))
+        blended = PatchApplier(0.5)(img, adv, msk)
+        covered = msk[0].sum(0).sum(0) > 0
         assert blended[0, :, covered].max() <= 0.5 + 1e-5
+
+    def test_fully_covered_pixels_take_the_patch_value_exactly(self):
+        """The old applier multiplied the mask into the patch, so grid_sample's fractional edge
+        values faded every patch border towards black instead of blending it with the scene.
+        """
+        img = torch.zeros(1, 3, 640, 640)
+        adv, msk = transform_pair(torch.full((3, 64, 64), 0.8), labels((0, 0.5, 0.5, 0.3, 0.3)))
+        out = PatchApplier(1.0)(img, adv, msk)
+        interior = msk[0].sum(0).sum(0) > 0.999
+        assert interior.any(), "expected a fully covered interior"
+        assert torch.allclose(out[0, :, interior], torch.tensor(0.8), atol=1e-3)
+
+    def test_zero_mask_leaves_the_image_untouched(self):
+        img = torch.rand(1, 3, 640, 640)
+        adv = torch.rand(1, 4, 3, 640, 640)
+        out = PatchApplier(1.0)(img, adv, torch.zeros(1, 4, 1, 640, 640))
+        assert torch.equal(out, img)
+
+
+class TestPhysicalEOT:
+    """Nuisances that decide whether a printed patch survives being photographed."""
+
+    def test_scale_is_drawn_per_instance_not_per_batch(self):
+        """tsize used to be one python scalar per forward, so every box in a step shared a scale."""
+        torch.manual_seed(0)
+        patch = torch.full((3, 64, 64), 0.5)
+        lab = labels((0, 0.3, 0.3, 0.2, 0.2), (0, 0.7, 0.7, 0.2, 0.2))
+        out = transform(patch, lab, t_size_frac=[0.1, 0.6])
+        widths = {nonzero_bbox(out[0, i])[2] - nonzero_bbox(out[0, i])[0] for i in (0, 1)}
+        assert len(widths) == 2, f"identical boxes must get independent scales, got {widths}"
+
+    def test_a_fixed_scale_still_renders_identical_boxes_identically(self):
+        patch = torch.full((3, 64, 64), 0.5)
+        lab = labels((0, 0.3, 0.3, 0.2, 0.2), (0, 0.7, 0.7, 0.2, 0.2))
+        out = transform(patch, lab, t_size_frac=0.3)
+        sizes = [nonzero_bbox(out[0, i])[2] - nonzero_bbox(out[0, i])[0] for i in (0, 1)]
+        assert sizes[0] == sizes[1]
+
+    def test_blur_removes_high_frequency_detail(self):
+        torch.manual_seed(0)
+        patch = torch.rand(3, 64, 64)
+        lab = labels((0, 0.5, 0.5, 0.4, 0.4))
+        rough = transform(patch, lab, blur_sigma_max=0.0, medianpool_kernel=0)
+        smooth = transform(patch, lab, blur_sigma_max=3.0, medianpool_kernel=0)
+
+        def hf(x):
+            return (x[..., 1:] - x[..., :-1]).abs().sum()
+
+        assert hf(smooth) < hf(rough)
+
+    def test_blur_is_off_by_default(self):
+        patch = torch.rand(3, 64, 64)
+        lab = labels((0, 0.5, 0.5, 0.4, 0.4))
+        assert torch.equal(transform(patch, lab), transform(patch, lab, blur_sigma_max=0.0))
+
+
+class TestPrintability:
+    """The patch is deployed as an 8 bit png, and for a physical attack through a printer."""
+
+    def test_forward_uses_the_8bit_patch_it_gets_saved_as(self):
+        patch = torch.rand(3, 64, 64)
+        lab = labels((0, 0.5, 0.5, 0.3, 0.3))
+        rounded = (patch * 255).round() / 255
+        assert torch.equal(transform(patch, lab), transform(rounded, lab))
+
+    def test_quantization_still_passes_gradient(self):
+        patch = torch.rand(3, 64, 64, requires_grad=True)
+        transform(patch, labels((0, 0.5, 0.5, 0.3, 0.3))).sum().backward()
+        assert patch.grad is not None and patch.grad.abs().sum() > 0
+
+    def test_palette_quantize_snaps_every_pixel_to_a_printable_color(self):
+        tf = make_transformer(printable_quantize=str(TRIPLETS))
+        patch = torch.rand(3, 16, 16, requires_grad=True)
+        out = tf.quantize(patch)
+
+        # Componentwise, not cdist: cdist's expanded quadratic form loses ~1e-4 near zero. The
+        # straight through identity (x + (snapped - x)) leaves a 1 ulp residue, hence the tolerance.
+        flat = out.permute(1, 2, 0).reshape(-1, 3)
+        err_to_nearest = (flat[:, None, :] - tf.palette[None, :, :]).abs().amax(-1).amin(-1)
+        assert err_to_nearest.max() < 1e-6
+        out.sum().backward()
+        assert patch.grad is not None and patch.grad.abs().sum() > 0
 
 
 class TestLosses:

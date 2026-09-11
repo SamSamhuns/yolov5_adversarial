@@ -21,7 +21,7 @@ from pycocotools.cocoeval import COCOeval
 from torchvision import transforms
 
 from adv_patch_gen.utils.common import IMG_EXTNS, BColors, pad_to_square, set_seed
-from adv_patch_gen.utils.config_parser import get_argparser, load_config_object
+from adv_patch_gen.utils.config_parser import get_argparser, load_config_object, validate_config
 from adv_patch_gen.utils.model import load_detector, unwrap_preds
 from adv_patch_gen.utils.patch import PatchApplier, PatchTransformer
 from adv_patch_gen.utils.video import (
@@ -72,6 +72,16 @@ def plot_conf_matrix(conf_matrix: ConfusionMatrix, save_dir: str, class_list: li
         os.replace(default_path, osp.join(save_dir, save_name))
 
 
+def weights_label(path: str) -> str:
+    """Short name identifying a weights file.
+
+    yolov5 writes runs/train/<run name>/weights/best.pt, so the stem is "best" for every model and
+    cannot tell two runs apart, either in the summary table or in the per model output directory.
+    """
+    path = Path(path)
+    return path.parent.parent.name if path.parent.name == "weights" else path.stem
+
+
 class PatchTester:
     """Module for testing patches on dataset against object detection models."""
 
@@ -91,6 +101,9 @@ class PatchTester:
             medianpool_kernel=cfg.get("medianpool_kernel", 7),
             perspective_scale=cfg.get("perspective_scale", 0.0),
             illumination_scale=cfg.get("illumination_scale", 0.0),
+            blur_sigma_max=cfg.get("blur_sigma_max", 0.0),
+            # reuse the NPS triplet file as the palette, it is the same list of printable colors
+            printable_quantize=cfg.triplet_printfile if cfg.get("printable_quantize") else None,
         ).to(self.dev)
         self.patch_applier = PatchApplier(cfg.patch_alpha).to(self.dev)
 
@@ -423,7 +436,7 @@ class PatchTester:
                     p_tensor_batch = padded_img_tensor
                 else:
                     # None is the random noise baseline, drawn fresh for each image
-                    adv_batch_t = self.patch_transformer(
+                    adv_batch_t, msk_batch_t = self.patch_transformer(
                         torch.rand_like(adv_patch) if patch is None else patch,
                         lab_fake_batch,
                         model_in_sz,
@@ -433,7 +446,7 @@ class PatchTester:
                         rand_loc=apply_patch_transforms,
                         do_perspective=apply_patch_transforms,
                     )
-                    p_tensor_batch = self.patch_applier(padded_img_tensor, adv_batch_t)
+                    p_tensor_batch = self.patch_applier(padded_img_tensor, adv_batch_t, msk_batch_t)
 
                 boxes, _, _ = self._detect(p_tensor_batch, conf_thresh, nms_thresh, cls_id, min_pixel_area)
                 preds.append(boxes.clone())
@@ -586,10 +599,12 @@ def main():
         "-w",
         "--weights",
         type=str,
+        nargs="+",
         dest="weights",
         default=None,
         required=False,
-        help='Path to yolov5 model wt. If None, use "weights_file" path in cfg json (default: %(default)s)',
+        help="Path(s) to yolov5 model wt. More than one evaluates the same patch against each, for "
+        'transferability. If None, use "weights_file" path in cfg json (default: %(default)s)',
     )
     parser.add_argument(
         "-p",
@@ -673,6 +688,16 @@ def main():
         help="Target one or more class ids for the misclassification test (default: %(default)s)",
     )
     parser.add_argument(
+        "--scale-sweep",
+        type=float,
+        nargs="+",
+        dest="scale_sweep",
+        default=None,
+        required=False,
+        help="Evaluate once per listed fixed target_size_frac, e.g. --scale-sweep 0.2 0.3 0.4. Answers how "
+        "large a printed patch has to be. Unlike --ts, each value is a scale, not a range bound",
+    )
+    parser.add_argument(
         "--min-pixel-area",
         type=int,
         dest="min_pixel_area",
@@ -685,15 +710,18 @@ def main():
     cfg = load_config_object(args.config)
     set_seed(cfg.get("seed", 42))
     cfg.device = args.device if args.device is not None else cfg.device
-    cfg.weights_file = (
-        args.weights if args.weights is not None else cfg.weights_file
-    )  # check if cfg.weights_file is ignored
-    cfg.patchfile = args.patchfile
-    cfg.imgdir = args.imgdir
+    weights_list = args.weights if args.weights else [cfg.weights_file]
+    cfg.weights_file = weights_list[0]
     if args.target_size_frac is not None:
         if len(args.target_size_frac) not in {1, 2}:
             raise ValueError("target_size_frac can only have one or two values")
         cfg.target_size_frac = args.target_size_frac[0] if len(args.target_size_frac) == 1 else args.target_size_frac
+    # the argparse overrides above used to bypass validation entirely, so a bad --ts silently
+    # produced garbage. Re-check before the runtime only keys below are attached.
+    validate_config(cfg)
+
+    cfg.patchfile = args.patchfile
+    cfg.imgdir = args.imgdir
 
     if args.savevideo and not args.saveimg:
         raise ValueError("To save videos, images must also be saved pass both --save-img & --save-vid flags")
@@ -708,22 +736,45 @@ def main():
         savename += ("_tc" + "-".join(str(c) for c in args.target_class)) if args.target_class else ""
     savename += "_agnostic" if args.class_agnostic else ""
     savename += f"_gt{args.min_pixel_area}" if args.min_pixel_area is not None else ""
-    cfg.savedir = osp.join(args.savedir, savename)
+    base_savedir = osp.join(args.savedir, savename)
 
     print(f"{BColors.OKBLUE} Test Arguments: {args} {BColors.ENDC}")
-    tester = PatchTester(cfg)
-    tester.test(
-        conf_thresh=args.conf_thresh,
-        nms_thresh=args.nms_thresh,
-        save_txt=args.savetxt,
-        save_image=args.saveimg,
-        class_agnostic=args.class_agnostic,
-        cls_id=args.target_class,
-        min_pixel_area=args.min_pixel_area,
-        save_plots=args.saveplots,
-        save_video=args.savevideo,
-        apply_patch_transforms=not args.no_patch_transforms,
-    )
+    summary = []
+    for weights in weights_list:
+        for frac in args.scale_sweep or [None]:
+            cfg.weights_file = weights
+            cfg.savedir = base_savedir
+            # only nest when there is something to disambiguate, so a plain run keeps its old layout
+            if len(weights_list) > 1:
+                cfg.savedir = osp.join(cfg.savedir, weights_label(weights))
+            if frac is not None:
+                cfg.target_size_frac = frac
+                cfg.savedir = osp.join(cfg.savedir, f"ts{frac}")
+
+            metrics = PatchTester(cfg).test(
+                conf_thresh=args.conf_thresh,
+                nms_thresh=args.nms_thresh,
+                save_txt=args.savetxt,
+                save_image=args.saveimg,
+                class_agnostic=args.class_agnostic,
+                cls_id=args.target_class,
+                min_pixel_area=args.min_pixel_area,
+                save_plots=args.saveplots,
+                save_video=args.savevideo,
+                apply_patch_transforms=not args.no_patch_transforms,
+            )
+            summary.append((weights_label(weights), frac, metrics["patch"]["asr"]))
+
+    if len(summary) > 1:
+        header = f"{'model':<28} {'scale':>7} {'asr_s':>7} {'asr_m':>7} {'asr_l':>7} {'asr_a':>7}"
+        lines = [header, "-" * len(header)]
+        for model, frac, (asr_s, asr_m, asr_l, asr_a) in summary:
+            scale = "cfg" if frac is None else f"{frac:.2f}"
+            lines.append(f"{model:<28} {scale:>7} {asr_s:>7.3f} {asr_m:>7.3f} {asr_l:>7.3f} {asr_a:>7.3f}")
+        table = "\n".join(lines)
+        print(f"\n{BColors.OKGREEN}Attack success rate summary{BColors.ENDC}\n{table}\n")
+        with open(osp.join(base_savedir, "asr_summary.txt"), "w", encoding="utf-8") as f_sum:
+            f_sum.write(table + "\n")
 
 
 if __name__ == "__main__":
